@@ -1,3 +1,7 @@
 streamlit
+google-generativeai
+groq
+smolagents
+supabase
 requests
-matplotlib
+Pillow
