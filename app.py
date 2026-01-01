@@ -1,8 +1,10 @@
+# app.py — AI 행정관 Pro (API 사용 내역 표시 + 완전 방어형 완세트)
 import streamlit as st
 import json
 import re
 import time
 from datetime import datetime, timedelta
+from html import escape as html_escape
 
 # =========================
 # Optional imports (안죽게)
@@ -26,7 +28,6 @@ try:
     from supabase import create_client
 except Exception:
     create_client = None
-
 
 # ==========================================
 # 1) Page Config & Styles
@@ -66,62 +67,76 @@ st.markdown(
 .log-draft { background-color: #fef2f2; color: #991b1b; border-left: 4px solid #ef4444; }
 .log-sys { background-color: #f3f4f6; color: #4b5563; border-left: 4px solid #9ca3af; }
 
-.strategy-box { background-color: #fffbeb; border: 1px solid #fcd34d; padding: 15px; border-radius: 8px; margin-bottom: 15px; }
+.badge-card {
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  margin-bottom: 8px;
+}
+.badge-sub { font-size: 0.85rem; color: #6b7280; margin-top: 2px; }
 </style>
 """,
     unsafe_allow_html=True,
 )
 
-
 # ==========================================
-# 2) Helpers: secrets safe-get
+# 2) Helpers
 # ==========================================
-def sget(path, default=None):
+def sget(*keys, default=None):
     """
-    sget(("general","GEMINI_API_KEY")) 형태로 안전 접근
+    sget("general","GEMINI_API_KEY") 처럼 안전 접근
     """
     cur = st.secrets
     try:
-        for k in path:
+        for k in keys:
             cur = cur[k]
         return cur
     except Exception:
         return default
 
+def api_card(title: str, ok: bool, subtitle: str = "") -> str:
+    icon = "✅" if ok else "⛔"
+    dim = "" if ok else "opacity:0.7;"
+    sub = f"<div class='badge-sub'>{html_escape(subtitle)}</div>" if subtitle else ""
+    return f"<div class='badge-card' style='{dim}'><div><b>{icon} {html_escape(title)}</b></div>{sub}</div>"
 
 # ==========================================
 # 3) Infrastructure Layer (Services)
 # ==========================================
 class LLMService:
     """
-    [Model Hierarchy]
-    1) Gemini 2.5 Flash
-    2) Gemini 2.5 Flash Lite
-    3) Gemini 2.0 Flash
-    4) Groq (Llama 3 Backup)
+    ✅ Patch:
+    - generate_text / generate_json 이 결과 + trace 반환
+      trace = {"provider":"gemini|groq|none", "model":"...", "ok":bool, "error":"..."}
     """
     def __init__(self):
-        self.gemini_key = sget(("general", "GEMINI_API_KEY"), None)
-        self.groq_key = sget(("general", "GROQ_API_KEY"), None)
+        self.gemini_key = sget("general", "GEMINI_API_KEY", default=None)
+        self.groq_key = sget("general", "GROQ_API_KEY", default=None)
 
-        self.gemini_models = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
+        self.gemini_models = [
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-2.0-flash",
+        ]
 
+        self.gemini_ok = False
         if self.gemini_key and genai is not None:
             try:
                 genai.configure(api_key=self.gemini_key)
                 self.gemini_ok = True
             except Exception:
                 self.gemini_ok = False
-        else:
-            self.gemini_ok = False
 
+        self.groq_client = None
         if self.groq_key and Groq is not None:
             try:
                 self.groq_client = Groq(api_key=self.groq_key)
             except Exception:
                 self.groq_client = None
-        else:
-            self.groq_client = None
+
+    def _trace(self, provider="none", model=None, ok=False, error=None):
+        return {"provider": provider, "model": model, "ok": ok, "error": str(error) if error else None}
 
     def _try_gemini_text(self, prompt: str):
         if not self.gemini_ok:
@@ -132,55 +147,70 @@ class LLMService:
             try:
                 model = genai.GenerativeModel(model_name)
                 res = model.generate_content(prompt)
-                return (res.text or "").strip(), model_name
+                text = (res.text or "").strip()
+                if not text:
+                    raise RuntimeError("Empty response")
+                return text, self._trace(provider="gemini", model=model_name, ok=True)
             except Exception as e:
                 last_err = e
                 continue
-        raise RuntimeError(f"All Gemini models failed: {last_err}")
 
-    def generate_text(self, prompt: str) -> str:
-        # 1) Gemini
+        raise RuntimeError(last_err)
+
+    def _try_groq_text(self, prompt: str):
+        if not self.groq_client:
+            raise RuntimeError("Groq not available")
         try:
-            text, _ = self._try_gemini_text(prompt)
-            if text:
-                return text
-        except Exception:
-            pass
+            completion = self.groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+            )
+            text = (completion.choices[0].message.content or "").strip()
+            if not text:
+                raise RuntimeError("Empty response")
+            return text, self._trace(provider="groq", model="llama-3.3-70b-versatile", ok=True)
+        except Exception as e:
+            raise RuntimeError(e)
+
+    def generate_text(self, prompt: str):
+        # 1) Gemini
+        gemini_err = None
+        try:
+            text, trace = self._try_gemini_text(prompt)
+            return text, trace
+        except Exception as e_g:
+            gemini_err = e_g
 
         # 2) Groq fallback
-        if self.groq_client is not None:
-            try:
-                completion = self.groq_client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.1,
-                )
-                return (completion.choices[0].message.content or "").strip()
-            except Exception:
-                pass
-
-        return "시스템 오류: AI 모델 연결 실패(Gemini/Groq 둘 다 불가)"
-
-    def generate_json(self, prompt: str, schema=None):
-        """
-        Gemini JSON mode는 라이브러리/모델별로 깨질 수 있어:
-        - 우선 텍스트 생성 → JSON 추출 파싱(가장 안정)
-        """
-        text = self.generate_text(prompt + "\n\n반드시 JSON만 출력하세요. 설명 금지.")
+        groq_err = None
         try:
-            # 가장 바깥 JSON 블록만 잡기
-            m = re.search(r"\{.*\}", text, re.DOTALL)
-            if not m:
-                return None
-            return json.loads(m.group(0))
-        except Exception:
-            return None
+            text, trace = self._try_groq_text(prompt)
+            return text, trace
+        except Exception as e_r:
+            groq_err = e_r
 
+        trace = self._trace(provider="none", model=None, ok=False, error=f"Gemini:{gemini_err} | Groq:{groq_err}")
+        return "시스템 오류: AI 모델 연결 실패", trace
+
+    def generate_json(self, prompt: str):
+        text, trace = self.generate_text(prompt + "\n\n반드시 JSON만 출력하세요. 설명 금지.")
+        obj = None
+        try:
+            m = re.search(r"\{.*\}", text, re.DOTALL)
+            if m:
+                obj = json.loads(m.group(0))
+        except Exception:
+            obj = None
+
+        if obj is None:
+            trace = {**trace, "ok": False, "error": (trace.get("error") or "") + " | JSON parse failed"}
+        return obj, trace, text
 
 class SearchService:
     """SerpApi(GoogleSearch) Wrapper"""
     def __init__(self):
-        self.api_key = sget(("general", "SERPAPI_KEY"), None)
+        self.api_key = sget("general", "SERPAPI_KEY", default=None)
 
     def search_precedents(self, query: str) -> str:
         if not self.api_key:
@@ -192,7 +222,7 @@ class SearchService:
             search_query = f"{query} 행정처분 판례 사례 민원 답변"
             params = {"engine": "google", "q": search_query, "api_key": self.api_key, "num": 3, "hl": "ko", "gl": "kr"}
             search = GoogleSearch(params)
-            results = search.get_dict().get("organic_results", []) or []
+            results = (search.get_dict() or {}).get("organic_results", []) or []
             if not results:
                 return "관련된 유사 사례 검색 결과가 없습니다."
 
@@ -206,7 +236,6 @@ class SearchService:
         except Exception as e:
             return f"검색 중 오류 발생: {e}"
 
-
 class DatabaseService:
     """Supabase Persistence Layer"""
     def __init__(self):
@@ -216,8 +245,8 @@ class DatabaseService:
         if create_client is None:
             return
 
-        url = sget(("supabase", "SUPABASE_URL"), None)
-        key = sget(("supabase", "SUPABASE_KEY"), None)
+        url = sget("supabase", "SUPABASE_URL", default=None)
+        key = sget("supabase", "SUPABASE_KEY", default=None)
         if not url or not key:
             return
 
@@ -231,7 +260,6 @@ class DatabaseService:
     def save_log(self, user_input, legal_basis, strategy, doc_data):
         if not self.is_active:
             return "DB 미연결 (저장 건너뜀)"
-
         try:
             final_summary_content = {"strategy": strategy, "document_content": doc_data}
             data = {
@@ -244,18 +272,17 @@ class DatabaseService:
         except Exception as e:
             return f"DB 저장 실패: {e}"
 
-
+# 싱글톤
 llm_service = LLMService()
 search_service = SearchService()
 db_service = DatabaseService()
-
 
 # ==========================================
 # 4) Domain Layer (Agents)
 # ==========================================
 class LegalAgents:
     @staticmethod
-    def researcher(situation: str) -> str:
+    def researcher(situation: str):
         prompt = f"""
 상황: "{situation}"
 
@@ -268,10 +295,11 @@ class LegalAgents:
 - 조항: ...
 - 한 줄 요지: ...
 """
-        return llm_service.generate_text(prompt).strip()
+        text, trace = llm_service.generate_text(prompt)
+        return text.strip(), trace
 
     @staticmethod
-    def strategist(situation: str, legal_basis: str, search_results: str) -> str:
+    def strategist(situation: str, legal_basis: str, search_results: str):
         prompt = f"""
 [민원 상황]
 {situation}
@@ -287,7 +315,8 @@ class LegalAgents:
 2. 핵심 주의사항
 3. 예상 반발 및 대응
 """
-        return llm_service.generate_text(prompt).strip()
+        text, trace = llm_service.generate_text(prompt)
+        return text.strip(), trace
 
     @staticmethod
     def clerk(situation: str, legal_basis: str):
@@ -300,26 +329,27 @@ class LegalAgents:
 행정처분 사전통지/이행명령 시 통상 부여하는 의견제출/이행기간 '일수'만 숫자로.
 모르면 15.
 """
+        text, trace = llm_service.generate_text(prompt)
+
         days = 15
         try:
-            res = llm_service.generate_text(prompt)
-            n = re.sub(r"[^0-9]", "", res)
+            n = re.sub(r"[^0-9]", "", text)
             if n:
                 days = max(1, min(60, int(n)))
         except Exception:
             days = 15
 
         deadline = today + timedelta(days=days)
-        return {
+        meta = {
             "today_str": today.strftime("%Y. %m. %d."),
             "deadline_str": deadline.strftime("%Y. %m. %d."),
             "days_added": days,
             "doc_num": f"행정-{today.strftime('%Y')}-{int(time.time())%1000:03d}호",
         }
+        return meta, trace
 
     @staticmethod
     def drafter(situation: str, legal_basis: str, meta_info: dict, strategy: str, dept: str, officer: str):
-        # 기본값 보정
         dept = (dept or "OOO과").strip()
         officer = (officer or "OOO").strip()
 
@@ -349,16 +379,14 @@ class LegalAgents:
   "title": "공문서 제목",
   "receiver": "수신인",
   "body_paragraphs": ["문단1", "문단2", "..."],
-  "department_head": "발신 명의(예: 충주시장 또는 OOO과장 등)",
-  "dept": "부서명",
-  "officer": "담당자"
+  "department_head": "발신 명의(예: 충주시장 또는 OOO과장 등)"
 }}
 """
-        doc = llm_service.generate_json(prompt)
+        obj, trace, raw = llm_service.generate_json(prompt)
 
         # 안전장치: JSON 실패 시 최소 문서 생성
-        if not isinstance(doc, dict):
-            doc = {
+        if not isinstance(obj, dict):
+            obj = {
                 "title": "공 문 서",
                 "receiver": "수신자 참조",
                 "body_paragraphs": [
@@ -368,61 +396,84 @@ class LegalAgents:
                     f"4. (의견제출/이행) 기한: {meta_info['deadline_str']}까지",
                     "5. 기타 문의는 담당부서로 연락주시기 바랍니다.",
                 ],
-                "department_head": "충주시장",
-                "dept": dept,
-                "officer": officer,
+                "department_head": "행정기관장",
             }
 
         # 필수키 보정
-        doc.setdefault("title", "공 문 서")
-        doc.setdefault("receiver", "수신자 참조")
-        doc.setdefault("body_paragraphs", [])
-        doc.setdefault("department_head", "충주시장")
-        doc["dept"] = dept
-        doc["officer"] = officer
-        if isinstance(doc["body_paragraphs"], str):
-            doc["body_paragraphs"] = [doc["body_paragraphs"]]
+        obj.setdefault("title", "공 문 서")
+        obj.setdefault("receiver", "수신자 참조")
+        obj.setdefault("body_paragraphs", [])
+        obj.setdefault("department_head", "행정기관장")
+        if isinstance(obj["body_paragraphs"], str):
+            obj["body_paragraphs"] = [obj["body_paragraphs"]]
 
-        return doc
+        # 표시용 메타도 박아두기
+        obj["_dept"] = dept
+        obj["_officer"] = officer
 
+        return obj, trace
 
 # ==========================================
-# 5) Workflow
+# 5) Workflow (API 사용 내역 100% 기록)
 # ==========================================
 def run_workflow(user_input: str, dept: str = None, officer: str = None):
-    # dept/officer가 None이면 세션값/기본값으로 보정
     dept = (dept or st.session_state.get("dept") or "OOO과").strip()
     officer = (officer or st.session_state.get("officer") or "OOO").strip()
 
     log_placeholder = st.empty()
     logs = []
 
-    def add_log(msg, style="sys"):
-        logs.append(f"<div class='agent-log log-{style}'>{msg}</div>")
-        log_placeholder.markdown("".join(logs), unsafe_allow_html=True)
-        time.sleep(0.15)
+    api_usage = {
+        "llm_calls": [],  # 단계별 LLM 호출 기록 (정확)
+        "serpapi": {"used": False, "error": None},
+        "supabase": {"used": False, "error": None},
+    }
 
+    def add_log(msg, style="sys"):
+        logs.append(f"<div class='agent-log log-{style}'>{html_escape(msg)}</div>")
+        log_placeholder.markdown("".join(logs), unsafe_allow_html=True)
+        time.sleep(0.2)
+
+    # Phase 1: Research
     add_log("🔍 Phase 1: 법령 리서치 중...", "legal")
-    legal_basis = LegalAgents.researcher(user_input)
-    add_log("📜 법적 근거 도출 완료", "legal")
+    legal_basis, trace1 = LegalAgents.researcher(user_input)
+    api_usage["llm_calls"].append({"step": "researcher", **trace1})
+    add_log(f"📜 법적 근거 도출 완료 ({trace1.get('provider')} / {trace1.get('model')})", "legal")
 
     add_log("🌍 Phase 1-2: 유사사례 검색 중...", "search")
     search_results = search_service.search_precedents(user_input)
+    if ("미설정" not in search_results) and ("미설치" not in search_results) and ("오류" not in search_results):
+        api_usage["serpapi"]["used"] = True
+    else:
+        api_usage["serpapi"]["error"] = search_results
 
+    # Phase 2: Strategy
     add_log("🧠 Phase 2: 처리 전략 수립 중...", "strat")
-    strategy = LegalAgents.strategist(user_input, legal_basis, search_results)
+    strategy, trace2 = LegalAgents.strategist(user_input, legal_basis, search_results)
+    api_usage["llm_calls"].append({"step": "strategist", **trace2})
+    add_log(f"🧭 전략 수립 완료 ({trace2.get('provider')} / {trace2.get('model')})", "strat")
 
+    # Phase 3: Deadline + Draft
     add_log("📅 Phase 3: 기한 산정 중...", "calc")
-    meta_info = LegalAgents.clerk(user_input, legal_basis)
+    meta_info, trace3 = LegalAgents.clerk(user_input, legal_basis)
+    api_usage["llm_calls"].append({"step": "clerk", **trace3})
+    add_log(f"📌 기한 산정 완료 ({trace3.get('provider')} / {trace3.get('model')})", "calc")
 
     add_log("✍️ Phase 3-2: 공문서 작성 중...", "draft")
-    doc_data = LegalAgents.drafter(user_input, legal_basis, meta_info, strategy, dept, officer)
+    doc_data, trace4 = LegalAgents.drafter(user_input, legal_basis, meta_info, strategy, dept, officer)
+    api_usage["llm_calls"].append({"step": "drafter", **trace4})
+    add_log(f"🧾 공문서 작성 완료 ({trace4.get('provider')} / {trace4.get('model')})", "draft")
 
+    # Phase 4: Save
     add_log("💾 Phase 4: DB 저장 중...", "sys")
     save_result = db_service.save_log(user_input, legal_basis, strategy, doc_data)
+    if "DB 저장 성공" in save_result:
+        api_usage["supabase"]["used"] = True
+    else:
+        api_usage["supabase"]["error"] = save_result
 
     add_log(f"✅ 완료: {save_result}", "sys")
-    time.sleep(0.4)
+    time.sleep(0.6)
     log_placeholder.empty()
 
     return {
@@ -432,25 +483,58 @@ def run_workflow(user_input: str, dept: str = None, officer: str = None):
         "search": search_results,
         "strategy": strategy,
         "save_msg": save_result,
+        "api_usage": api_usage,
     }
 
+# ==========================================
+# 6) UI Helpers
+# ==========================================
+def render_api_usage(usage: dict):
+    llm_calls = usage.get("llm_calls", [])
+    serp = usage.get("serpapi", {})
+    supa = usage.get("supabase", {})
+
+    st.markdown("### 🔌 이번 업무 처리에서 사용된 API")
+
+    # LLM calls
+    if llm_calls:
+        for c in llm_calls:
+            ok = bool(c.get("ok"))
+            step = c.get("step", "llm")
+            provider = c.get("provider", "none")
+            model = c.get("model", "")
+            err = c.get("error", "")
+            subtitle = f"{step}: {provider} / {model}" + (f" | error: {err}" if (not ok and err) else "")
+            st.markdown(api_card("LLM 호출", ok, subtitle), unsafe_allow_html=True)
+    else:
+        st.markdown(api_card("LLM 호출", False, "호출 기록 없음"), unsafe_allow_html=True)
+
+    # SerpApi
+    if serp.get("used"):
+        st.markdown(api_card("SerpApi (Google Search)", True, "유사사례 검색 수행"), unsafe_allow_html=True)
+    else:
+        st.markdown(api_card("SerpApi (Google Search)", False, serp.get("error") or "미사용"), unsafe_allow_html=True)
+
+    # Supabase
+    if supa.get("used"):
+        st.markdown(api_card("Supabase (DB)", True, "로그 저장 완료"), unsafe_allow_html=True)
+    else:
+        st.markdown(api_card("Supabase (DB)", False, supa.get("error") or "미사용"), unsafe_allow_html=True)
 
 # ==========================================
-# 6) UI
+# 7) Presentation Layer (Main)
 # ==========================================
 def main():
     col_left, col_right = st.columns([1, 1.2])
 
     with col_left:
         st.title("🏢 AI 행정관 Pro")
-        st.caption("Gemini + Search + Strategy + DB")
+        st.caption("Gemini + Groq + Search + Strategy + DB + API Trace")
         st.markdown("---")
 
         st.markdown("### 🧾 기본 정보")
-        # dept/officer 입력(UI 추가) — 이게 지금 에러의 핵심 해결
         dept = st.text_input("부서(과)명", value=st.session_state.get("dept", "차량민원과"))
         officer = st.text_input("담당자(주무관)", value=st.session_state.get("officer", "OOO"))
-
         st.session_state["dept"] = dept
         st.session_state["officer"] = officer
 
@@ -458,7 +542,7 @@ def main():
         user_input = st.text_area(
             "업무 내용",
             height=150,
-            placeholder="예시:\n- 아파트 단지 내 소방차 전용구역 불법주차 차량에 대한 조치(과태료/계도) 안내문 초안 작성",
+            placeholder="예시:\n- 아파트 단지 내 소방차 전용구역 불법 주차 차량에 대한 조치(계도/과태료) 안내문 초안 작성",
             label_visibility="collapsed",
         )
 
@@ -480,11 +564,17 @@ def main():
             res = st.session_state["workflow_result"]
 
             st.markdown("---")
-            if "성공" in (res.get("save_msg") or ""):
-                st.success(f"✅ {res['save_msg']}")
-            else:
-                st.error(f"❌ {res['save_msg']}")
 
+            # DB 결과
+            if "성공" in (res.get("save_msg") or ""):
+                st.success(f"✅ {res.get('save_msg')}")
+            else:
+                st.error(f"❌ {res.get('save_msg')}")
+
+            # API 사용 내역 표시 (요청사항)
+            render_api_usage(res.get("api_usage", {}))
+
+            # 법령/검색
             with st.expander("✅ [검토] 법령 및 유사 사례 확인", expanded=True):
                 c1, c2 = st.columns(2)
                 with c1:
@@ -494,6 +584,7 @@ def main():
                     st.markdown("**🌍 유사 사례**")
                     st.info(res.get("search", ""))
 
+            # 전략
             with st.expander("🧭 [방향] 업무 처리 가이드라인", expanded=True):
                 st.markdown(res.get("strategy", ""))
 
@@ -507,28 +598,28 @@ def main():
             if isinstance(paragraphs, str):
                 paragraphs = [paragraphs]
 
-            # HTML은 "왼쪽 끝에 붙여서" 만들기(렌더링 안정)
+            # HTML은 왼쪽 끝에 붙여서(렌더 안정)
             html_parts = []
             html_parts.append('<div class="paper-sheet">')
             html_parts.append('<div class="stamp">직인생략</div>')
-            html_parts.append(f'<div class="doc-header">{doc.get("title","공 문 서")}</div>')
+            html_parts.append(f'<div class="doc-header">{html_escape(str(doc.get("title","공 문 서")))}</div>')
             html_parts.append('<div class="doc-info">')
-            html_parts.append(f'<span>문서번호: {meta.get("doc_num","")}</span>')
-            html_parts.append(f'<span>시행일자: {meta.get("today_str","")}</span>')
-            html_parts.append(f'<span>수신: {doc.get("receiver","수신자 참조")}</span>')
-            html_parts.append(f'<span>부서: {doc.get("dept", st.session_state.get("dept",""))}</span>')
-            html_parts.append(f'<span>담당: {doc.get("officer", st.session_state.get("officer",""))}</span>')
+            html_parts.append(f'<span>문서번호: {html_escape(str(meta.get("doc_num","")))}</span>')
+            html_parts.append(f'<span>시행일자: {html_escape(str(meta.get("today_str","")))}</span>')
+            html_parts.append(f'<span>수신: {html_escape(str(doc.get("receiver","수신자 참조")))}</span>')
+            html_parts.append(f'<span>부서: {html_escape(str(doc.get("_dept", st.session_state.get("dept",""))))}</span>')
+            html_parts.append(f'<span>담당: {html_escape(str(doc.get("_officer", st.session_state.get("officer",""))))}</span>')
             html_parts.append("</div>")
             html_parts.append('<hr style="border: 1px solid black; margin-bottom: 30px;">')
             html_parts.append('<div class="doc-body">')
             for p in paragraphs:
-                safe_p = (p or "").replace("<", "&lt;").replace(">", "&gt;")
-                html_parts.append(f"<p style='margin-bottom: 15px;'>{safe_p}</p>")
+                html_parts.append(f"<p style='margin-bottom: 15px;'>{html_escape(str(p))}</p>")
             html_parts.append("</div>")
-            html_parts.append(f'<div class="doc-footer">{doc.get("department_head","행정기관장")}</div>')
+            html_parts.append(f'<div class="doc-footer">{html_escape(str(doc.get("department_head","행정기관장")))}</div>')
             html_parts.append("</div>")
 
             st.markdown("".join(html_parts), unsafe_allow_html=True)
+
         else:
             st.markdown(
                 """
@@ -539,7 +630,6 @@ def main():
 """,
                 unsafe_allow_html=True,
             )
-
 
 if __name__ == "__main__":
     main()
