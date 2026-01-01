@@ -1,4 +1,4 @@
-# app.py — AI 행정관 Pro (LAWGO: JO 표시 + 연관 법령 3개 + NAVER Search + Gemini→Groq + Supabase)
+# app.py — AI 행정관 Pro (LAWGO: 링크 클릭=원문 + NAVER 결과 파싱 고정 + 연관법령 3개 + JO 표시)
 import streamlit as st
 import json
 import re
@@ -73,6 +73,11 @@ st.markdown(
 .api-ok { border-color:#bbf7d0; background:#f0fdf4; }
 .api-bad { border-color:#fecaca; background:#fef2f2; }
 .small-muted { color:#6b7280; font-size:12px; }
+
+.item-card { background:#fff; border:1px solid #e5e7eb; border-radius:12px; padding:12px 14px; margin-bottom:10px; }
+.item-title { font-weight:700; }
+.item-meta { color:#6b7280; font-size:12px; margin-top:4px; line-height:1.3; }
+.item-desc { margin-top:8px; white-space:pre-line; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -89,6 +94,26 @@ def mask_pii(text: str) -> str:
     text = re.sub(r"\b\d{6}-\d{7}\b", "OOOOOO-OOOOOOO", text)
     text = re.sub(r"\b\d{2,3}[가-힣]\d{4}\b", "OOO", text)
     return text
+
+
+def normalize_text(s: str) -> str:
+    """HTML/개행/과도한 공백 정리. '틀 밖 튐' 방지용."""
+    if not s:
+        return ""
+    s = re.sub(r"<.*?>", "", s)            # HTML tag 제거
+    s = s.replace("&quot;", '"').replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    s = re.sub(r"\s+", " ", s).strip()     # 공백 정리
+    return s
+
+
+def safe_url(u: str) -> str:
+    """link 필드에 이상한 값 들어와도 UI 안 터지게"""
+    if not u:
+        return ""
+    u = u.strip()
+    if not (u.startswith("http://") or u.startswith("https://")):
+        return ""
+    return u
 
 
 # =========================================================
@@ -114,21 +139,12 @@ class Trace:
 # 4) Services
 # =========================================================
 class LLMService:
-    """
-    Gemini(텍스트/JSON) -> 실패 시 Groq fallback
-    secrets:
-      [general]
-      GEMINI_API_KEY
-      GROQ_API_KEY
-      GROQ_MODEL
-    """
     def __init__(self, trace: Trace):
         self.trace = trace
         g = st.secrets.get("general", {})
         self.gemini_key = g.get("GEMINI_API_KEY")
         self.groq_key = g.get("GROQ_API_KEY")
         self.groq_model = g.get("GROQ_MODEL", "llama-3.3-70b-versatile")
-
         self.gemini_models = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
 
         self._gemini_ready = False
@@ -164,21 +180,16 @@ class LLMService:
                 return (res.text or "").strip()
             except Exception as e:
                 last = e
-                # ResourceExhausted 등도 트레이스 남기기
                 self.trace.add("Gemini.generate_content", False, f"model={m} err={type(e).__name__}")
         raise RuntimeError(last)
 
     def generate_text(self, prompt: str) -> str:
-        # Gemini
         try:
             return self._try_gemini_text(prompt)
         except Exception:
             pass
-
-        # Groq
         if not self.groq_client:
             return "시스템 오류: LLM 연결 실패(Gemini/Groq 모두 불가)."
-
         try:
             completion = self.groq_client.chat.completions.create(
                 model=self.groq_model,
@@ -203,12 +214,6 @@ class LLMService:
 
 
 class LawAPIService:
-    """
-    법제처 국가법령정보 DRF
-    secrets:
-      [general]
-      LAW_API_ID = OC
-    """
     BASE_SEARCH = "https://www.law.go.kr/DRF/lawSearch.do"
     BASE_SERVICE = "https://www.law.go.kr/DRF/lawService.do"
 
@@ -241,17 +246,12 @@ class LawAPIService:
         data = self._get_json(self.BASE_SEARCH, params, "LAWGO.lawSearch", "endpoint=lawSearch.do")
         if not isinstance(data, dict):
             return []
-
-        # 유연 파싱
         candidates = []
-        # 1) LawSearch.law
         if isinstance(data.get("LawSearch"), dict) and isinstance(data["LawSearch"].get("law"), list):
             candidates = data["LawSearch"]["law"]
-        # 2) lawSearch.law
         elif isinstance(data.get("lawSearch"), dict) and isinstance(data["lawSearch"].get("law"), list):
             candidates = data["lawSearch"]["law"]
         else:
-            # 3) dict 내부 탐색
             for v in data.values():
                 if isinstance(v, dict) and isinstance(v.get("law"), list):
                     candidates = v["law"]
@@ -263,9 +263,11 @@ class LawAPIService:
                 continue
             law_name = item.get("법령명한글") or item.get("법령명_한글") or item.get("법령명") or ""
             mst = item.get("법령일련번호") or item.get("MST") or item.get("lsi_seq")
+            # 상세링크가 상대경로로 내려오는 경우가 있어 보정 (법제처 도메인 붙이기)
             link = item.get("법령상세링크") or ""
+            if link and link.startswith("/"):
+                link = "https://www.law.go.kr" + link
             out.append({"law_name": str(law_name).strip(), "mst": str(mst) if mst else None, "link": str(link), "raw": item})
-        # 빈 이름 제거
         out = [x for x in out if x["law_name"]]
         return out
 
@@ -278,7 +280,6 @@ class LawAPIService:
 
     @staticmethod
     def normalize_jo(jo_text: str) -> str | None:
-        # "제32조" / "32조" / "제10조의2" -> "003200" / "001002"
         if not jo_text:
             return None
         s = jo_text.replace(" ", "")
@@ -295,13 +296,10 @@ class LawAPIService:
     def _extract_article_text(data: dict) -> str:
         if not isinstance(data, dict):
             return ""
-        # 넓게 탐색 (구조가 일정치 않아서 안전하게)
-        # 1) 직키
         for key in ["조문내용", "joCntnt", "JO_CNTNT", "content", "Content"]:
             v = data.get(key)
             if isinstance(v, str) and v.strip():
                 return v.strip()
-        # 2) 문자열 덤프에서 "조문내용" 찾아보기
         try:
             txt = json.dumps(data, ensure_ascii=False)
             m = re.search(r'"조문내용"\s*:\s*"([^"]+)"', txt)
@@ -312,26 +310,18 @@ class LawAPIService:
         return ""
 
     def get_related_laws_pack(self, situation: str, llm: LLMService, topk: int = 3):
-        """
-        ✅ 요구사항:
-        - 법령 1개가 아니라 연관 법령 3개 뽑기
-        - JO(6자리) 계산해서 meta에 넣기
-        - 각 법령별로 (가능하면) 조문 내용까지 가져오기
-        """
         situation_m = mask_pii(situation)
 
-        # 1) LLM으로 "후보 법령/조항" 여러 개 추출
         extract_prompt = f"""
 너는 대한민국 행정 실무용 '법령 후보 추출기'다.
-아래 상황에 연관된 법령을 최대 5개까지 후보로 뽑아라.
-각 후보는 법령명과 대표 조항(있으면)을 포함해라.
+아래 상황에 연관된 법령 후보를 최대 6개 뽑아라.
+각 후보는 법령명과 대표 조항(있으면)을 포함.
 
 반드시 JSON만:
 {{
   "candidates": [
-    {{"law_name": "자동차관리법", "article": "제26조"}},
     {{"law_name": "도로교통법", "article": "제32조"}},
-    {{"law_name": "주차장법", "article": ""}}
+    {{"law_name": "소방기본법", "article": ""}}
   ]
 }}
 
@@ -342,7 +332,6 @@ class LawAPIService:
         if not isinstance(cand, list):
             cand = []
 
-        # 후보 정리(최대 8개, 중복 제거)
         cleaned = []
         seen = set()
         for x in cand:
@@ -352,19 +341,16 @@ class LawAPIService:
             ar = (x.get("article") or "").strip()
             if not ln:
                 continue
-            key = ln
-            if key in seen:
+            if ln in seen:
                 continue
-            seen.add(key)
+            seen.add(ln)
             cleaned.append({"law_name": ln, "article": ar})
             if len(cleaned) >= 8:
                 break
 
-        # 후보가 너무 빈약하면: 상황 키워드로도 보강
         if len(cleaned) < topk:
-            # 상황 문장 앞부분으로 검색해 1~2개 보강
             kw = re.sub(r"\s+", " ", situation_m).strip()[:40]
-            kw_results = self.search_law(kw, display=5)
+            kw_results = self.search_law(kw, display=8)
             for it in kw_results:
                 ln = it["law_name"]
                 if ln not in seen:
@@ -373,7 +359,6 @@ class LawAPIService:
                 if len(cleaned) >= 8:
                     break
 
-        # 2) 각 후보 법령을 lawSearch로 확정(MST 얻기)
         picked = []
         picked_names = set()
 
@@ -387,6 +372,7 @@ class LawAPIService:
             law_name = best.get("law_name") or q
             mst = best.get("mst")
             link = best.get("link", "")
+
             if not law_name or law_name in picked_names:
                 continue
             picked_names.add(law_name)
@@ -397,77 +383,19 @@ class LawAPIService:
                 data = self.fetch_article(mst, jo6)
                 article_text = self._extract_article_text(data)
 
-            picked.append(
-                {
-                    "law_name": law_name,
-                    "article": ar,
-                    "jo6": jo6,
-                    "mst": mst,
-                    "link": link,
-                    "article_text": article_text,
-                }
-            )
+            picked.append({"law_name": law_name, "article": ar, "jo6": jo6, "mst": mst, "link": link, "article_text": article_text})
             if len(picked) >= topk:
                 break
 
-        # 3) 그래도 부족하면: lawSearch로 추가 채우기(상황 키워드 기반)
-        if len(picked) < topk:
-            kw = re.sub(r"\s+", " ", situation_m).strip()[:40]
-            sr2 = self.search_law(kw, display=10)
-            for best in sr2:
-                law_name = best.get("law_name")
-                if not law_name or law_name in picked_names:
-                    continue
-                mst = best.get("mst")
-                link = best.get("link", "")
-                article_text = ""
-                if mst:
-                    data = self.fetch_article(mst, jo6=None)
-                    article_text = self._extract_article_text(data)
-                picked.append(
-                    {
-                        "law_name": law_name,
-                        "article": "",
-                        "jo6": None,
-                        "mst": mst,
-                        "link": link,
-                        "article_text": article_text,
-                    }
-                )
-                picked_names.add(law_name)
-                if len(picked) >= topk:
-                    break
-
-        # 최종 fallback
         if not picked:
-            picked = [
-                {
-                    "law_name": "법령 API 검색 실패(결과 없음)",
-                    "article": "",
-                    "jo6": None,
-                    "mst": None,
-                    "link": "",
-                    "article_text": "",
-                }
-            ]
+            picked = [{"law_name": "법령 API 검색 실패(결과 없음)", "article": "", "jo6": None, "mst": None, "link": "", "article_text": ""}]
 
-        # 첫 번째를 primary로 취급
         primary = picked[0]
         legal_basis_text = primary["law_name"] + (f" {primary['article']}" if primary.get("article") else "")
-        return {
-            "primary": primary,
-            "related": picked,  # 최대 3개
-            "legal_basis_text": legal_basis_text,
-        }
+        return {"primary": primary, "related": picked, "legal_basis_text": legal_basis_text}
 
 
 class NaverSearchService:
-    """
-    secrets:
-      [naver]
-      CLIENT_ID
-      CLIENT_SECRET
-    """
     BASE = "https://openapi.naver.com/v1/search"
 
     def __init__(self, trace: Trace):
@@ -478,7 +406,7 @@ class NaverSearchService:
         if not self.client_id or not self.client_secret:
             self.trace.add("NAVER.init", False, "CLIENT_ID/SECRET missing")
 
-    def _call(self, endpoint: str, query: str, display: int = 3, sort: str = "sim"):
+    def _call(self, endpoint: str, query: str, display: int = 5, sort: str = "sim"):
         if requests is None:
             self.trace.add(f"NAVER.{endpoint}", False, "requests missing")
             return None
@@ -498,41 +426,58 @@ class NaverSearchService:
             self.trace.add(f"NAVER.{endpoint}", False, f"{type(e).__name__}: {e}")
             return None
 
-    @staticmethod
-    def _strip_html(s: str) -> str:
-        return re.sub(r"<.*?>", "", s or "").strip()
-
-    def search_precedents(self, situation: str) -> str:
-        q1 = f"{situation} 행정처분"
+    def search_precedents_parsed(self, situation: str) -> list[dict]:
+        """
+        ✅ '사례 틀 벗어나는 문제' 해결:
+        - 네이버 응답(items)을 그대로 "구조화된 리스트"로 만든다
+        - HTML 제거/공백정리/URL 보정
+        - UI는 이 리스트를 카드로 렌더 → 절대 튀어나가지 않음
+        """
+        q1 = f"{situation} 행정처분 사례"
         q2 = f"{situation} 과태료 기준"
 
-        news = self._call("news", q1, display=3)
-        webkr = self._call("webkr", q2, display=3)
+        news = self._call("news", q1, display=5)
+        webkr = self._call("webkr", q2, display=5)
 
-        lines = []
-        def add_items(data, label):
+        out = []
+
+        def push_items(data, source):
             if not data:
                 return
-            for it in (data.get("items") or [])[:3]:
-                title = self._strip_html(it.get("title", ""))
-                link = it.get("link", "")
-                desc = self._strip_html(it.get("description", "")) or self._strip_html(it.get("snippet", ""))
-                if title:
-                    lines.append(f"- **[{label}] {title}**: {desc}\n  - {link}")
+            for it in (data.get("items") or [])[:5]:
+                title = normalize_text(it.get("title", ""))
+                desc = normalize_text(it.get("description", "")) or normalize_text(it.get("snippet", ""))
+                link = safe_url(it.get("link", "") or "")
+                pub = normalize_text(it.get("originallink", "")) if source == "news" else ""
+                # 너무 긴 문자열은 UI 안전하게 자르기
+                if len(desc) > 300:
+                    desc = desc[:300] + "…"
+                out.append(
+                    {
+                        "source": source,
+                        "title": title or "(제목 없음)",
+                        "desc": desc,
+                        "link": link,
+                        "extra": pub,
+                    }
+                )
 
-        add_items(news, "뉴스")
-        add_items(webkr, "웹문서")
+        push_items(news, "news")
+        push_items(webkr, "webkr")
 
-        return "\n".join(lines) if lines else "관련 검색 결과가 없습니다."
+        # 중복 링크 제거
+        uniq = []
+        seen = set()
+        for x in out:
+            key = x.get("link") or (x["source"] + x["title"])
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(x)
+        return uniq
 
 
 class DatabaseService:
-    """
-    secrets:
-      [supabase]
-      SUPABASE_URL
-      SUPABASE_KEY
-    """
     def __init__(self, trace: Trace):
         self.trace = trace
         self.is_active = False
@@ -572,12 +517,11 @@ class DatabaseService:
 # =========================================================
 class LegalAgents:
     @staticmethod
-    def strategist(llm: LLMService, situation: str, laws_pack: dict, search_results: str):
-        primary = laws_pack.get("primary", {}) or {}
-        related = laws_pack.get("related", []) or []
+    def strategist(llm: LLMService, situation: str, laws_pack: dict, precedent_items: list[dict]):
         legal_basis = laws_pack.get("legal_basis_text", "")
+        related = laws_pack.get("related", []) or []
+        primary = laws_pack.get("primary", {}) or {}
 
-        # 법령 3개 요약 문자열
         rel_lines = []
         for i, it in enumerate(related[:3], 1):
             nm = it.get("law_name", "")
@@ -585,10 +529,13 @@ class LegalAgents:
             jo6 = it.get("jo6")
             mst = it.get("mst")
             rel_lines.append(f"{i}) {nm} {ar} (MST={mst}, JO={jo6})")
-        rel_block = "\n".join(rel_lines)
+        rel_block = "\n".join(rel_lines) if rel_lines else "(없음)"
 
-        # primary 조문
-        primary_article = (primary.get("article_text") or "").strip()
+        # 네이버 결과를 "짧은 텍스트"로만 요약해 LLM 입력 폭주 방지
+        brief = []
+        for it in (precedent_items or [])[:6]:
+            brief.append(f"- [{it.get('source')}] {it.get('title')}: {it.get('desc')}")
+        brief_block = "\n".join(brief) if brief else "(검색 결과 없음)"
 
         prompt = f"""
 너는 행정 실무 '주무관'이다.
@@ -596,17 +543,17 @@ class LegalAgents:
 [민원 상황]
 {situation}
 
-[확정/연관 법령 3개(법제처 API)]
-{rel_block}
-
-[주요 근거(1순위)]
+[대표 근거]
 {legal_basis}
 
-[1순위 조문 내용(가능하면)]
-{primary_article}
+[대표 MST/JO]
+MST={primary.get("mst")} / JO={primary.get("jo6")}
 
-[네이버 검색(유사 사례)]
-{search_results}
+[연관 법령 3개]
+{rel_block}
+
+[유사 사례(네이버 검색 요약)]
+{brief_block}
 
 아래 3개 항목을 마크다운으로:
 1. **처리 방향**
@@ -650,7 +597,6 @@ class LegalAgents:
         primary = laws_pack.get("primary", {}) or {}
         related = laws_pack.get("related", []) or []
 
-        # 법령 3개를 문서 본문에 자연스럽게 반영
         rel_bullets = []
         for it in related[:3]:
             nm = it.get("law_name", "")
@@ -673,7 +619,7 @@ class LegalAgents:
 [입력]
 - 민원 상황: {situation}
 - 대표 근거: {laws_pack.get("legal_basis_text","")}
-- 대표 법령 MST/JO: MST={primary.get("mst")} / JO={primary.get("jo6")}  (JO는 6자리)
+- 대표 법령 MST/JO: MST={primary.get("mst")} / JO={primary.get("jo6")} (JO는 6자리)
 - 대표 조문 내용(가능하면): {primary.get("article_text","")}
 - 연관 법령(최대 3개):
 {rel_text}
@@ -730,38 +676,33 @@ def run_workflow(user_input: str):
     def add_log(msg, style="sys"):
         logs.append(f"<div class='agent-log log-{style}'>{escape(msg)}</div>")
         log_placeholder.markdown("".join(logs), unsafe_allow_html=True)
-        time.sleep(0.2)
+        time.sleep(0.18)
 
-    # Phase 1: LAWGO (3개)
     add_log("🔍 Phase 1: 법령 API(법제처)로 대표+연관 법령 3개 찾는 중...", "legal")
     laws_pack = law_api.get_related_laws_pack(user_input, llm, topk=3)
     add_log(f"📜 대표 근거: {laws_pack.get('legal_basis_text','')}", "legal")
 
-    # Phase 1b: NAVER search
-    add_log("🔎 Phase 1b: 네이버 검색 API로 유사사례 조회 중...", "search")
-    search_results = naver.search_precedents(user_input)
+    add_log("🔎 Phase 1b: 네이버 검색 API → 구조화 파싱 중...", "search")
+    precedent_items = naver.search_precedents_parsed(user_input)
 
-    # Phase 2: Strategy
     add_log("🧠 Phase 2: 업무 처리 방향 수립 중...", "strat")
-    strategy = LegalAgents.strategist(llm, user_input, laws_pack, search_results)
+    strategy = LegalAgents.strategist(llm, user_input, laws_pack, precedent_items)
 
-    # Phase 3: Meta & Draft
     add_log("📅 Phase 3: 기한 산정 중...", "calc")
     meta_info = LegalAgents.clerk(llm, user_input, laws_pack.get("legal_basis_text", ""))
 
     add_log("✍️ Phase 3b: 공문서 작성 중...", "draft")
     doc_data = LegalAgents.drafter(llm, user_input, laws_pack, meta_info, strategy)
 
-    # Phase 4: Save
     add_log("💾 Phase 4: Supabase 저장 시도...", "sys")
     payload = {
         "situation": mask_pii(user_input),
         "law_name": laws_pack.get("legal_basis_text", ""),
         "summary": json.dumps(
             {
-                "laws_pack": laws_pack,            # ✅ 법령 3개 + MST/JO(jo6) 포함
+                "laws_pack": laws_pack,
+                "precedent_items": precedent_items,
                 "strategy": strategy,
-                "search": search_results,
                 "document_content": doc_data,
                 "api_trace": trace.items,
             },
@@ -771,14 +712,14 @@ def run_workflow(user_input: str):
     save_msg = db.save_log("law_reports", payload)
 
     add_log(f"✅ 완료: {save_msg}", "sys")
-    time.sleep(0.6)
+    time.sleep(0.5)
     log_placeholder.empty()
 
     return {
         "doc": doc_data,
         "meta": meta_info,
         "laws_pack": laws_pack,
-        "search": search_results,
+        "precedent_items": precedent_items,
         "strategy": strategy,
         "save_msg": save_msg,
         "api_trace": trace.items,
@@ -805,21 +746,52 @@ def render_api_trace(trace_items):
     )
 
 
+def law_link_from_meta(link: str, mst: str | None, jo6: str | None, oc: str | None) -> str:
+    """
+    1) API에서 내려온 link(법령상세링크)가 있으면 그걸 우선 사용
+    2) 없으면 lawService HTML 링크를 만들어서 원문으로 연결
+    """
+    link = safe_url(link)
+    if link:
+        return link
+
+    if not (mst and oc):
+        return ""
+    # 법제처 원문(HTML) 보기: lawService.do?OC=...&target=law&MST=...&type=HTML (&JO=...)
+    base = f"https://www.law.go.kr/DRF/lawService.do?OC={oc}&target=law&MST={mst}&type=HTML"
+    if jo6:
+        base += f"&JO={jo6}"
+    return base
+
+
 def render_laws_pack(laws_pack: dict):
     related = laws_pack.get("related", []) or []
     if not related:
         st.warning("법령 결과가 없습니다.")
         return
 
+    g = st.secrets.get("general", {})
+    oc = g.get("LAW_API_ID")
+
     st.markdown("**📜 대표 + 연관 법령 (최대 3개)**")
     for idx, it in enumerate(related[:3], 1):
         nm = it.get("law_name", "")
         ar = it.get("article", "")
         mst = it.get("mst")
-        jo6 = it.get("jo6")  # ✅ 6자리 JO
+        jo6 = it.get("jo6")
         link = it.get("link", "")
-        st.markdown(f"**{idx}) {nm} {ar}**")
-        st.caption(f"MST: {mst} | JO(6자리): {jo6} | 링크: {link}")
+
+        full_url = law_link_from_meta(link, mst, jo6, oc)
+
+        # ✅ 1) 법령 제목 자체를 "클릭 링크"로
+        if full_url:
+            st.markdown(f"### {idx}) [{escape(nm)} {escape(ar)}]({full_url})")
+            # 모바일에서 더 잘 눌리게 버튼도 추가
+            st.link_button(f"🔗 원문 보기 - {idx}", full_url, use_container_width=True)
+        else:
+            st.markdown(f"### {idx}) {escape(nm)} {escape(ar)}")
+
+        st.caption(f"MST: {mst} | JO(6자리): {jo6}")
 
         art = (it.get("article_text") or "").strip()
         if art:
@@ -827,6 +799,32 @@ def render_laws_pack(laws_pack: dict):
                 st.info(art)
         else:
             st.caption("조문 내용은 JO/MST 매칭이 불완전하면 비어 있을 수 있습니다.")
+
+
+def render_precedents(items: list[dict]):
+    """
+    ✅ 2) '사례 틀 벗어남' 방지:
+    - 마크다운으로 긴 URL/특수문자/HTML 넣지 않고
+    - 카드 형태로 title/desc/link를 안정적으로 렌더
+    """
+    if not items:
+        st.info("관련 검색 결과가 없습니다.")
+        return
+
+    for it in items[:10]:
+        src = it.get("source", "")
+        title = it.get("title", "")
+        desc = it.get("desc", "")
+        link = safe_url(it.get("link", "") or "")
+
+        src_label = "뉴스" if src == "news" else "웹문서"
+
+        st.markdown("<div class='item-card'>", unsafe_allow_html=True)
+        st.markdown(f"<div class='item-title'>[{src_label}] {escape(title)}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='item-desc'>{escape(desc)}</div>", unsafe_allow_html=True)
+        if link:
+            st.link_button("열기", link, use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
 
 def main():
@@ -868,11 +866,11 @@ def main():
                 render_api_trace(res.get("api_trace", []))
                 st.markdown(res.get("api_trace_md", ""))
 
-            with st.expander("✅ [검토] 법령(법제처 API) — 대표+연관 3개 + JO 표시", expanded=True):
+            with st.expander("✅ [검토] 법령(법제처 API) — 제목 클릭=원문 보기", expanded=True):
                 render_laws_pack(res.get("laws_pack", {}))
 
-            with st.expander("🔎 [검토] 유사 사례(네이버 검색 API)", expanded=True):
-                st.markdown(res.get("search", "검색 결과 없음"))
+            with st.expander("🔎 [검토] 유사 사례(네이버 검색 API) — 파싱 고정", expanded=True):
+                render_precedents(res.get("precedent_items", []))
 
             with st.expander("🧭 [방향] 업무 처리 가이드라인", expanded=True):
                 st.markdown(res.get("strategy", ""))
