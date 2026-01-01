@@ -1,24 +1,26 @@
 import streamlit as st
-import io
-import time
+import json
 import re
-import html
-import requests
-import xml.etree.ElementTree as ET
-from PIL import Image
+import time
+from datetime import datetime, timedelta
 
 # =========================
 # Optional imports (안죽게)
 # =========================
+try:
+    import google.generativeai as genai
+except Exception:
+    genai = None
+
 try:
     from groq import Groq
 except Exception:
     Groq = None
 
 try:
-    import google.generativeai as genai
+    from serpapi import GoogleSearch
 except Exception:
-    genai = None
+    GoogleSearch = None
 
 try:
     from supabase import create_client
@@ -27,39 +29,44 @@ except Exception:
 
 
 # ==========================================
-# 1) Page & Style
+# 1) Page Config & Styles
 # ==========================================
-st.set_page_config(layout="wide", page_title="AI 행정관: AMP System", page_icon="🏛️")
+st.set_page_config(layout="wide", page_title="AI 행정관 Pro", page_icon="🏛️")
 
 st.markdown(
     """
 <style>
-    .stApp { background-color: #f8f9fa; }
+.stApp { background-color: #f3f4f6; }
 
-    .log-box {
-        padding: 12px; border-radius: 6px; margin-bottom: 8px;
-        font-family: 'Consolas', monospace; font-size: 0.92em;
-        box-shadow: 0 1px 2px rgba(0,0,0,0.05);
-        animation: fadeIn 0.2s ease-in-out;
-        white-space: pre-wrap;
-        line-height: 1.45;
-    }
-    .log-law   { background-color: #eff6ff; border-left: 5px solid #3b82f6; color: #1e3a8a; }
-    .log-naver { background-color: #f0fdf4; border-left: 5px solid #22c55e; color: #14532d; }
-    .log-db    { background-color: #fef2f2; border-left: 5px solid #ef4444; color: #7f1d1d; }
-    .log-brain { background-color: #f3f4f6; border-left: 5px solid #6b7280; color: #111827; }
+.paper-sheet {
+  background-color: white;
+  width: 100%;
+  max-width: 210mm;
+  min-height: 297mm;
+  padding: 25mm;
+  margin: auto;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+  font-family: 'Batang', serif;
+  color: #111;
+  line-height: 1.6;
+  position: relative;
+}
 
-    @keyframes fadeIn { from { opacity: 0; transform: translateY(4px);} to { opacity: 1; transform: translateY(0);} }
+.doc-header { text-align: center; font-size: 22pt; font-weight: 900; margin-bottom: 30px; letter-spacing: 2px; }
+.doc-info { display: flex; justify-content: space-between; font-size: 11pt; border-bottom: 2px solid #333; padding-bottom: 10px; margin-bottom: 20px; gap: 10px; flex-wrap: wrap;}
+.doc-body { font-size: 12pt; text-align: justify; white-space: pre-line; }
+.doc-footer { text-align: center; font-size: 20pt; font-weight: bold; margin-top: 80px; letter-spacing: 5px; }
+.stamp { position: absolute; bottom: 85px; right: 80px; border: 3px solid #cc0000; color: #cc0000; padding: 5px 10px; font-size: 14pt; font-weight: bold; transform: rotate(-15deg); opacity: 0.8; border-radius: 5px; }
 
-    .result-card {
-        background: white;
-        padding: 26px;
-        border-radius: 12px;
-        border: 1px solid #e5e7eb;
-        box-shadow: 0 2px 10px rgba(0,0,0,0.05);
-    }
+.agent-log { font-family: 'Consolas', monospace; font-size: 0.85rem; padding: 6px 12px; border-radius: 6px; margin-bottom: 8px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
+.log-legal { background-color: #eff6ff; color: #1e40af; border-left: 4px solid #3b82f6; }
+.log-search { background-color: #fff7ed; color: #c2410c; border-left: 4px solid #f97316; }
+.log-strat { background-color: #f5f3ff; color: #6d28d9; border-left: 4px solid #8b5cf6; }
+.log-calc { background-color: #f0fdf4; color: #166534; border-left: 4px solid #22c55e; }
+.log-draft { background-color: #fef2f2; color: #991b1b; border-left: 4px solid #ef4444; }
+.log-sys { background-color: #f3f4f6; color: #4b5563; border-left: 4px solid #9ca3af; }
 
-    .small-muted { color:#6b7280; font-size:0.9em; }
+.strategy-box { background-color: #fffbeb; border: 1px solid #fcd34d; padding: 15px; border-radius: 8px; margin-bottom: 15px; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -67,399 +74,471 @@ st.markdown(
 
 
 # ==========================================
-# 2) Utils
+# 2) Helpers: secrets safe-get
 # ==========================================
-def log_box(kind: str, msg: str):
-    css = {
-        "law": "log-box log-law",
-        "naver": "log-box log-naver",
-        "db": "log-box log-db",
-        "brain": "log-box log-brain",
-    }.get(kind, "log-box log-brain")
-    st.markdown(f"<div class='{css}'>{html.escape(msg)}</div>", unsafe_allow_html=True)
-
-
-def sget(*path, default=None):
-    """st.secrets safe getter: sget("general","GROQ_API_KEY")"""
+def sget(path, default=None):
+    """
+    sget(("general","GEMINI_API_KEY")) 형태로 안전 접근
+    """
     cur = st.secrets
     try:
-        for p in path:
-            cur = cur[p]
+        for k in path:
+            cur = cur[k]
         return cur
     except Exception:
         return default
 
 
-def clean_html_tags(text: str) -> str:
-    if not text:
-        return ""
-    # 네이버 API title에 <b>가 들어오니 제거
-    return re.sub(r"</?b>", "", text)
-
-
 # ==========================================
-# 3) External Calls (LAW / NAVER / VISION / DB)
+# 3) Infrastructure Layer (Services)
 # ==========================================
-def call_law_api(query: str, display: int = 5) -> dict:
+class LLMService:
     """
-    국가법령정보센터 DRF lawSearch 호출
-    반환: {"items":[{"name":..,"link":..},...], "raw": "..."} 형태
+    [Model Hierarchy]
+    1) Gemini 2.5 Flash
+    2) Gemini 2.5 Flash Lite
+    3) Gemini 2.0 Flash
+    4) Groq (Llama 3 Backup)
     """
-    q = (query or "").strip()
-    if not q:
-        return {"items": [], "raw": "검색어가 비어있습니다."}
+    def __init__(self):
+        self.gemini_key = sget(("general", "GEMINI_API_KEY"), None)
+        self.groq_key = sget(("general", "GROQ_API_KEY"), None)
 
-    api_id = sget("general", "LAW_API_ID")
-    if not api_id:
-        return {"items": [], "raw": "LAW_API_ID 미설정(st.secrets['general']['LAW_API_ID'])"}
+        self.gemini_models = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
 
-    url = "https://www.law.go.kr/DRF/lawSearch.do"
-    params = {
-        "OC": api_id,
-        "target": "law",
-        "type": "XML",
-        "query": q,
-        "display": int(display),
-    }
+        if self.gemini_key and genai is not None:
+            try:
+                genai.configure(api_key=self.gemini_key)
+                self.gemini_ok = True
+            except Exception:
+                self.gemini_ok = False
+        else:
+            self.gemini_ok = False
 
-    log_box("law", f"🏛️ [Step1-LAW] 국가법령정보센터 조회: '{q}'")
-    try:
-        resp = requests.get(url, params=params, timeout=12)
-        resp.raise_for_status()
+        if self.groq_key and Groq is not None:
+            try:
+                self.groq_client = Groq(api_key=self.groq_key)
+            except Exception:
+                self.groq_client = None
+        else:
+            self.groq_client = None
 
-        # XML 파싱 (가끔 인코딩 문제 방어)
-        content = resp.content
+    def _try_gemini_text(self, prompt: str):
+        if not self.gemini_ok:
+            raise RuntimeError("Gemini not available")
+
+        last_err = None
+        for model_name in self.gemini_models:
+            try:
+                model = genai.GenerativeModel(model_name)
+                res = model.generate_content(prompt)
+                return (res.text or "").strip(), model_name
+            except Exception as e:
+                last_err = e
+                continue
+        raise RuntimeError(f"All Gemini models failed: {last_err}")
+
+    def generate_text(self, prompt: str) -> str:
+        # 1) Gemini
         try:
-            root = ET.fromstring(content)
+            text, _ = self._try_gemini_text(prompt)
+            if text:
+                return text
         except Exception:
-            root = ET.fromstring(resp.text.encode("utf-8", errors="ignore"))
+            pass
 
-        items = []
-        for law in root.findall(".//law"):
-            nm = law.findtext("lawNm") or ""
-            link = law.findtext("lawDetailLink") or ""
-            nm = nm.strip()
-            link = link.strip()
-            if nm:
-                items.append({"name": nm, "link": link})
+        # 2) Groq fallback
+        if self.groq_client is not None:
+            try:
+                completion = self.groq_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.1,
+                )
+                return (completion.choices[0].message.content or "").strip()
+            except Exception:
+                pass
 
-        log_box("law", f"↳ 수신 완료: {len(items)}건")
-        raw = "\n".join([f"- {it['name']} ({it['link'][-24:] if it['link'] else ''})" for it in items]) or "검색 결과 없음"
-        return {"items": items, "raw": raw}
+        return "시스템 오류: AI 모델 연결 실패(Gemini/Groq 둘 다 불가)"
 
-    except Exception as e:
-        return {"items": [], "raw": f"API 오류: {e}"}
+    def generate_json(self, prompt: str, schema=None):
+        """
+        Gemini JSON mode는 라이브러리/모델별로 깨질 수 있어:
+        - 우선 텍스트 생성 → JSON 추출 파싱(가장 안정)
+        """
+        text = self.generate_text(prompt + "\n\n반드시 JSON만 출력하세요. 설명 금지.")
+        try:
+            # 가장 바깥 JSON 블록만 잡기
+            m = re.search(r"\{.*\}", text, re.DOTALL)
+            if not m:
+                return None
+            return json.loads(m.group(0))
+        except Exception:
+            return None
 
 
-def call_naver_search(query: str) -> dict:
-    """
-    네이버 검색 API (뉴스 1건 + 블로그 1건)
-    반환: {"news": {...}|None, "blog": {...}|None, "raw":"..."}
-    """
-    q = (query or "").strip()
-    if not q:
-        return {"news": None, "blog": None, "raw": "검색어가 비어있습니다."}
+class SearchService:
+    """SerpApi(GoogleSearch) Wrapper"""
+    def __init__(self):
+        self.api_key = sget(("general", "SERPAPI_KEY"), None)
 
-    cid = sget("naver", "CLIENT_ID")
-    csec = sget("naver", "CLIENT_SECRET")
-    if not cid or not csec:
-        return {"news": None, "blog": None, "raw": "네이버 API 키 미설정(naver.CLIENT_ID / CLIENT_SECRET)"}
+    def search_precedents(self, query: str) -> str:
+        if not self.api_key:
+            return "⚠️ SERPAPI_KEY 미설정: 유사 사례 검색 생략"
+        if GoogleSearch is None:
+            return "⚠️ serpapi 패키지 미설치: 유사 사례 검색 생략(requirements.txt 확인)"
 
-    headers = {"X-Naver-Client-Id": cid, "X-Naver-Client-Secret": csec}
+        try:
+            search_query = f"{query} 행정처분 판례 사례 민원 답변"
+            params = {"engine": "google", "q": search_query, "api_key": self.api_key, "num": 3, "hl": "ko", "gl": "kr"}
+            search = GoogleSearch(params)
+            results = search.get_dict().get("organic_results", []) or []
+            if not results:
+                return "관련된 유사 사례 검색 결과가 없습니다."
 
-    log_box("naver", f"🌱 [Step2-NAVER] 네이버 검색 호출: '{q}'")
+            summary = []
+            for item in results:
+                title = item.get("title", "제목 없음")
+                snippet = item.get("snippet", "내용 없음")
+                link = item.get("link", "#")
+                summary.append(f"- **[{title}]({link})**: {snippet}")
+            return "\n".join(summary)
+        except Exception as e:
+            return f"검색 중 오류 발생: {e}"
 
-    out_lines = []
-    news_item = None
-    blog_item = None
 
-    try:
-        news = requests.get(
-            "https://openapi.naver.com/v1/search/news.json",
-            headers=headers,
-            params={"query": q, "display": 1, "sort": "date"},
-            timeout=12,
-        ).json()
-        items = news.get("items") or []
-        if items:
-            it = items[0]
-            news_item = {
-                "title": clean_html_tags(it.get("title", "")),
-                "link": it.get("link", ""),
-                "description": clean_html_tags(it.get("description", "")),
-                "pubDate": it.get("pubDate", ""),
+class DatabaseService:
+    """Supabase Persistence Layer"""
+    def __init__(self):
+        self.is_active = False
+        self.client = None
+
+        if create_client is None:
+            return
+
+        url = sget(("supabase", "SUPABASE_URL"), None)
+        key = sget(("supabase", "SUPABASE_KEY"), None)
+        if not url or not key:
+            return
+
+        try:
+            self.client = create_client(url, key)
+            self.is_active = True
+        except Exception:
+            self.is_active = False
+            self.client = None
+
+    def save_log(self, user_input, legal_basis, strategy, doc_data):
+        if not self.is_active:
+            return "DB 미연결 (저장 건너뜀)"
+
+        try:
+            final_summary_content = {"strategy": strategy, "document_content": doc_data}
+            data = {
+                "situation": user_input,
+                "law_name": legal_basis,
+                "summary": json.dumps(final_summary_content, ensure_ascii=False),
             }
-            out_lines.append(f"[뉴스] {news_item['title']}")
-
-    except Exception as e:
-        out_lines.append(f"[뉴스] 오류: {e}")
-
-    try:
-        blog = requests.get(
-            "https://openapi.naver.com/v1/search/blog.json",
-            headers=headers,
-            params={"query": q + " 판례 행정해석", "display": 1, "sort": "date"},
-            timeout=12,
-        ).json()
-        items = blog.get("items") or []
-        if items:
-            it = items[0]
-            blog_item = {
-                "title": clean_html_tags(it.get("title", "")),
-                "link": it.get("link", ""),
-                "description": clean_html_tags(it.get("description", "")),
-                "postdate": it.get("postdate", ""),
-            }
-            out_lines.append(f"[블로그] {blog_item['title']}")
-
-    except Exception as e:
-        out_lines.append(f"[블로그] 오류: {e}")
-
-    log_box("naver", "↳ 수신 완료")
-    raw = "\n".join(out_lines) if out_lines else "결과 없음"
-    return {"news": news_item, "blog": blog_item, "raw": raw}
+            self.client.table("law_reports").insert(data).execute()
+            return "DB 저장 성공"
+        except Exception as e:
+            return f"DB 저장 실패: {e}"
 
 
-def analyze_image_gemini(image_bytes: bytes) -> str:
-    """
-    Gemini Vision (있으면 사용, 없으면 OFF)
-    """
-    if genai is None:
-        return "이미지 분석 OFF: google-generativeai 미설치"
-
-    gkey = sget("general", "GEMINI_API_KEY")
-    if not gkey:
-        return "이미지 분석 OFF: GEMINI_API_KEY 미설정"
-
-    try:
-        genai.configure(api_key=gkey)
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        img = Image.open(io.BytesIO(image_bytes))
-
-        log_box("brain", "👁️ [Vision] Gemini가 첨부 이미지를 분석 중...")
-
-        resp = model.generate_content(
-            [
-                "다음 이미지(공문/현장사진)의 내용을 한국어로 상세히 텍스트화 하시오. "
-                "문서번호/기관명/주소/날짜/표/직인 관련 표기까지 최대한 원문 형태로.",
-                img,
-            ]
-        )
-        return getattr(resp, "text", "") or "이미지 분석 결과가 비어있습니다."
-    except Exception as e:
-        return f"이미지 분석 실패: {e}"
-
-
-def save_to_supabase(summary: str) -> str:
-    """
-    Supabase law_reports 테이블에 저장
-    """
-    log_box("db", "💾 [DB] Supabase 저장 시도...")
-
-    if create_client is None:
-        return "DB 저장 스킵: supabase 패키지 미설치"
-
-    url = sget("supabase", "SUPABASE_URL")
-    key = sget("supabase", "SUPABASE_KEY")
-    if not url or not key:
-        return "DB 저장 스킵: SUPABASE_URL/KEY 미설정"
-
-    text = (summary or "").strip()
-    if not text:
-        return "DB 저장 스킵: summary가 비어있음"
-
-    try:
-        sb = create_client(url, key)
-        sb.table("law_reports").insert({"summary": text}).execute()
-        st.toast("DB 저장 성공!", icon="✅")
-        return "저장 성공"
-    except Exception as e:
-        return f"저장 실패: {e}"
+llm_service = LLMService()
+search_service = SearchService()
+db_service = DatabaseService()
 
 
 # ==========================================
-# 4) Groq LLM (문서 생성 전용)
+# 4) Domain Layer (Agents)
 # ==========================================
-def groq_generate(prompt: str, temperature: float = 0.15) -> str:
-    if Groq is None:
-        return "LLM 오류: groq 패키지 미설치"
+class LegalAgents:
+    @staticmethod
+    def researcher(situation: str) -> str:
+        prompt = f"""
+상황: "{situation}"
 
-    gkey = sget("general", "GROQ_API_KEY")
-    if not gkey:
-        return "LLM 오류: GROQ_API_KEY 미설정"
-
-    client = Groq(api_key=gkey)
-    model = sget("general", "GROQ_MODEL", default="llama-3.3-70b-versatile")
-
-    log_box("brain", f"🧠 [LLM] Groq 생성 호출 (model={model})")
-
-    try:
-        completion = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": "너는 한국 지방행정 실무 + 행정법 + 공문서 작성 전문가다. 과장 없이 근거 중심으로 작성한다."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=temperature,
-        )
-        return completion.choices[0].message.content
-    except Exception as e:
-        return f"LLM 오류: {e}"
-
-
-# ==========================================
-# 5) AMP Orchestrator (DDG 0% 직접 통제)
-# ==========================================
-def run_amp(mw_text: str, vision_text: str, law_query: str, naver_query: str, doc_type: str) -> str:
-    """
-    Step1: call_law_api
-    Step2: call_naver_search
-    Step3: groq_generate(최종 문서)
-    + DB 저장(요약)
-    """
-    # Step1 (법령)
-    law_res = call_law_api(law_query, display=5)
-    law_raw = law_res["raw"]
-
-    # Step2 (사례/여론)
-    naver_res = call_naver_search(naver_query)
-    naver_raw = naver_res["raw"]
-
-    # Step3 (최종 문서 생성)
-    # doc_type: "답변서" or "처분사전통지서"
-    draft_instruction = {
-        "답변서": "민원 답변 공문(국문) 형식으로 작성하라. 서두 인사→사안 판단→법적 근거→조치 가능/불가 및 안내→문의처 순으로.",
-        "처분사전통지서": "처분사전통지서(초안) 형식으로 작성하라. 처분의 원인이 되는 사실, 법적 근거, 예정 처분 내용, 의견제출 기한/방법을 포함하라.",
-    }.get(doc_type, "민원 답변 공문 형식으로 작성하라.")
-
-    prompt = f"""
-[입력-민원]
-{mw_text}
-
-[입력-사진 분석(있으면)]
-{vision_text}
-
-[Step1 결과-법령 API]
-{law_raw}
-
-[Step2 결과-네이버 검색]
-{naver_raw}
-
-[작성 지시]
-- 위 Step1/2 결과를 근거로 사실관계를 정리하고, 실무적으로 가능한 조치만 제시하라.
-- 근거 없는 단정 금지. 불명확하면 '추가 확인 필요'로 표시.
-- {draft_instruction}
+위 상황에 적용할 가장 정확한 '법령명'과 '관련 조항'을 하나만 찾으시오.
+반드시 현행 대한민국 법령이어야 하며, 조항 번호까지 명시하세요.
+예: 도로교통법 제32조(정차 및 주차의 금지)
 
 [출력 형식]
-## Step 1: Analyst (법률 검토)
-- 적용 가능 법령 후보
-- 위법/적법/불명확 판단 및 이유
-
-## Step 2: Manager (사례/해석)
-- 유사 사례 요지(뉴스/블로그)
-- 행정 조치 옵션(1안/2안/3안)과 추천 1안
-
-## Step 3: Practitioner (최종 문서)
-- 최종 문서 전문(복붙 가능)
-
-## DB 저장용 요약(5줄)
-- 핵심 근거/조치/기한/안내처
+- 법령명: ...
+- 조항: ...
+- 한 줄 요지: ...
 """
-    final_text = groq_generate(prompt, temperature=0.15)
+        return llm_service.generate_text(prompt).strip()
 
-    # DB 저장(요약만)
-    summary = extract_db_summary(final_text)
-    db_msg = save_to_supabase(summary)
-    log_box("db", f"↳ {db_msg}")
+    @staticmethod
+    def strategist(situation: str, legal_basis: str, search_results: str) -> str:
+        prompt = f"""
+[민원 상황]
+{situation}
 
-    return final_text
+[법적 근거]
+{legal_basis}
+
+[유사 사례/판례]
+{search_results}
+
+위 정보를 종합하여 처리 전략을 마크다운으로 작성:
+1. 처리 방향
+2. 핵심 주의사항
+3. 예상 반발 및 대응
+"""
+        return llm_service.generate_text(prompt).strip()
+
+    @staticmethod
+    def clerk(situation: str, legal_basis: str):
+        today = datetime.now()
+        prompt = f"""
+오늘: {today.strftime('%Y-%m-%d')}
+상황: {situation}
+법령: {legal_basis}
+
+행정처분 사전통지/이행명령 시 통상 부여하는 의견제출/이행기간 '일수'만 숫자로.
+모르면 15.
+"""
+        days = 15
+        try:
+            res = llm_service.generate_text(prompt)
+            n = re.sub(r"[^0-9]", "", res)
+            if n:
+                days = max(1, min(60, int(n)))
+        except Exception:
+            days = 15
+
+        deadline = today + timedelta(days=days)
+        return {
+            "today_str": today.strftime("%Y. %m. %d."),
+            "deadline_str": deadline.strftime("%Y. %m. %d."),
+            "days_added": days,
+            "doc_num": f"행정-{today.strftime('%Y')}-{int(time.time())%1000:03d}호",
+        }
+
+    @staticmethod
+    def drafter(situation: str, legal_basis: str, meta_info: dict, strategy: str, dept: str, officer: str):
+        # 기본값 보정
+        dept = (dept or "OOO과").strip()
+        officer = (officer or "OOO").strip()
+
+        prompt = f"""
+너는 행정기관 문서 작성자다. 아래 정보를 바탕으로 '완결된 공문서'를 JSON으로 작성하라.
+설명 금지. JSON만.
+
+[입력]
+- 민원 상황: {situation}
+- 법적 근거: {legal_basis}
+- 시행일자: {meta_info['today_str']}
+- 기한: {meta_info['deadline_str']} ({meta_info['days_added']}일)
+- 부서명: {dept}
+- 담당자: {officer}
+
+[전략]
+{strategy}
+
+[작성 원칙]
+- 본문 구조: [경위] -> [근거] -> [처분/조치 내용] -> [권리구제/안내]
+- 개인정보(이름/번호)는 반드시 OOO 마스킹
+- 문서 톤: 정중/건조한 행정문
+- receiver가 불명확하면 합리적으로 추론
+
+[JSON 스키마]
+{{
+  "title": "공문서 제목",
+  "receiver": "수신인",
+  "body_paragraphs": ["문단1", "문단2", "..."],
+  "department_head": "발신 명의(예: 충주시장 또는 OOO과장 등)",
+  "dept": "부서명",
+  "officer": "담당자"
+}}
+"""
+        doc = llm_service.generate_json(prompt)
+
+        # 안전장치: JSON 실패 시 최소 문서 생성
+        if not isinstance(doc, dict):
+            doc = {
+                "title": "공 문 서",
+                "receiver": "수신자 참조",
+                "body_paragraphs": [
+                    "1. 귀하의 민원에 감사드립니다.",
+                    f"2. 본 건은 다음 법령에 따라 검토되었습니다: {legal_basis}",
+                    "3. 관련 규정 및 현장 여건을 종합하여 필요한 조치를 진행하겠습니다.",
+                    f"4. (의견제출/이행) 기한: {meta_info['deadline_str']}까지",
+                    "5. 기타 문의는 담당부서로 연락주시기 바랍니다.",
+                ],
+                "department_head": "충주시장",
+                "dept": dept,
+                "officer": officer,
+            }
+
+        # 필수키 보정
+        doc.setdefault("title", "공 문 서")
+        doc.setdefault("receiver", "수신자 참조")
+        doc.setdefault("body_paragraphs", [])
+        doc.setdefault("department_head", "충주시장")
+        doc["dept"] = dept
+        doc["officer"] = officer
+        if isinstance(doc["body_paragraphs"], str):
+            doc["body_paragraphs"] = [doc["body_paragraphs"]]
+
+        return doc
 
 
-def extract_db_summary(final_text: str) -> str:
-    """
-    'DB 저장용 요약(5줄)' 섹션이 있으면 그 부분을 저장.
-    없으면 앞부분 일부를 저장.
-    """
-    if not final_text:
-        return ""
-    m = re.search(r"##\s*DB\s*저장용\s*요약.*?\n(.+)$", final_text, flags=re.DOTALL | re.IGNORECASE)
-    if m:
-        tail = m.group(1).strip()
-        # 너무 길면 컷
-        return tail[:1800]
-    return final_text.strip()[:1800]
+# ==========================================
+# 5) Workflow
+# ==========================================
+def run_workflow(user_input: str, dept: str = None, officer: str = None):
+    # dept/officer가 None이면 세션값/기본값으로 보정
+    dept = (dept or st.session_state.get("dept") or "OOO과").strip()
+    officer = (officer or st.session_state.get("officer") or "OOO").strip()
+
+    log_placeholder = st.empty()
+    logs = []
+
+    def add_log(msg, style="sys"):
+        logs.append(f"<div class='agent-log log-{style}'>{msg}</div>")
+        log_placeholder.markdown("".join(logs), unsafe_allow_html=True)
+        time.sleep(0.15)
+
+    add_log("🔍 Phase 1: 법령 리서치 중...", "legal")
+    legal_basis = LegalAgents.researcher(user_input)
+    add_log("📜 법적 근거 도출 완료", "legal")
+
+    add_log("🌍 Phase 1-2: 유사사례 검색 중...", "search")
+    search_results = search_service.search_precedents(user_input)
+
+    add_log("🧠 Phase 2: 처리 전략 수립 중...", "strat")
+    strategy = LegalAgents.strategist(user_input, legal_basis, search_results)
+
+    add_log("📅 Phase 3: 기한 산정 중...", "calc")
+    meta_info = LegalAgents.clerk(user_input, legal_basis)
+
+    add_log("✍️ Phase 3-2: 공문서 작성 중...", "draft")
+    doc_data = LegalAgents.drafter(user_input, legal_basis, meta_info, strategy, dept, officer)
+
+    add_log("💾 Phase 4: DB 저장 중...", "sys")
+    save_result = db_service.save_log(user_input, legal_basis, strategy, doc_data)
+
+    add_log(f"✅ 완료: {save_result}", "sys")
+    time.sleep(0.4)
+    log_placeholder.empty()
+
+    return {
+        "doc": doc_data,
+        "meta": meta_info,
+        "law": legal_basis,
+        "search": search_results,
+        "strategy": strategy,
+        "save_msg": save_result,
+    }
 
 
 # ==========================================
 # 6) UI
 # ==========================================
 def main():
-    st.title("🏛️ AI 행정관 Pro (AMP System) — DDG ZERO")
-    st.caption("법령 API(Blue) / 네이버(Green) / DB(Red) / LLM&Vision(Gray)")
+    col_left, col_right = st.columns([1, 1.2])
 
-    with st.expander("⚙️ 런타임 체크(문제 생길 때만)", expanded=False):
-        st.write(
-            {
-                "groq_installed": Groq is not None,
-                "gemini_installed": genai is not None,
-                "supabase_installed": create_client is not None,
-                "GROQ_API_KEY": bool(sget("general", "GROQ_API_KEY")),
-                "GEMINI_API_KEY": bool(sget("general", "GEMINI_API_KEY")),
-                "LAW_API_ID": bool(sget("general", "LAW_API_ID")),
-                "NAVER_KEYS": bool(sget("naver", "CLIENT_ID")) and bool(sget("naver", "CLIENT_SECRET")),
-                "SUPABASE_KEYS": bool(sget("supabase", "SUPABASE_URL")) and bool(sget("supabase", "SUPABASE_KEY")),
-            }
+    with col_left:
+        st.title("🏢 AI 행정관 Pro")
+        st.caption("Gemini + Search + Strategy + DB")
+        st.markdown("---")
+
+        st.markdown("### 🧾 기본 정보")
+        # dept/officer 입력(UI 추가) — 이게 지금 에러의 핵심 해결
+        dept = st.text_input("부서(과)명", value=st.session_state.get("dept", "차량민원과"))
+        officer = st.text_input("담당자(주무관)", value=st.session_state.get("officer", "OOO"))
+
+        st.session_state["dept"] = dept
+        st.session_state["officer"] = officer
+
+        st.markdown("### 🗣️ 업무 지시")
+        user_input = st.text_area(
+            "업무 내용",
+            height=150,
+            placeholder="예시:\n- 아파트 단지 내 소방차 전용구역 불법주차 차량에 대한 조치(과태료/계도) 안내문 초안 작성",
+            label_visibility="collapsed",
         )
 
-    col1, col2 = st.columns([1, 1.1])
+        if st.button("⚡ 스마트 행정 처분 시작", type="primary", use_container_width=True):
+            if not user_input.strip():
+                st.warning("내용을 입력해주세요.")
+            else:
+                try:
+                    with st.spinner("AI 에이전트 팀이 협업 중입니다..."):
+                        st.session_state["workflow_result"] = run_workflow(
+                            user_input=user_input.strip(),
+                            dept=dept.strip(),
+                            officer=officer.strip(),
+                        )
+                except Exception as e:
+                    st.error(f"시스템 오류 발생: {e}")
 
-    with col1:
-        st.subheader("📝 민원 접수")
+        if "workflow_result" in st.session_state:
+            res = st.session_state["workflow_result"]
 
-        uploaded_file = st.file_uploader("증빙 서류/사진", type=["jpg", "png", "jpeg"])
-        mw_text = st.text_area("민원 내용", height=170, placeholder="내용을 입력하세요.")
+            st.markdown("---")
+            if "성공" in (res.get("save_msg") or ""):
+                st.success(f"✅ {res['save_msg']}")
+            else:
+                st.error(f"❌ {res['save_msg']}")
 
-        st.markdown("### 🔎 검색 키워드(직접 통제)")
-        st.caption("에이전트가 마음대로 검색어를 바꾸지 못하게, 여기서 사람이 키워드를 고정합니다.")
+            with st.expander("✅ [검토] 법령 및 유사 사례 확인", expanded=True):
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown("**📜 적용 법령**")
+                    st.code(res.get("law", ""), language="text")
+                with c2:
+                    st.markdown("**🌍 유사 사례**")
+                    st.info(res.get("search", ""))
 
-        law_query = st.text_input("법령 검색어(국가법령 API)", value="자동차관리법")
-        naver_query = st.text_input("네이버 검색어(사례/해석)", value="자동차관리법 무단방치 과태료 행정처분")
+            with st.expander("🧭 [방향] 업무 처리 가이드라인", expanded=True):
+                st.markdown(res.get("strategy", ""))
 
-        doc_type = st.radio("최종 산출물", ["답변서", "처분사전통지서"], horizontal=True)
+    with col_right:
+        if "workflow_result" in st.session_state:
+            res = st.session_state["workflow_result"]
+            doc = res.get("doc") or {}
+            meta = res.get("meta") or {}
 
-        st.markdown("<div class='small-muted'>※ Gemini Vision / Supabase는 키가 없으면 자동으로 OFF/스킵됩니다.</div>", unsafe_allow_html=True)
+            paragraphs = doc.get("body_paragraphs", [])
+            if isinstance(paragraphs, str):
+                paragraphs = [paragraphs]
 
-        if st.button("🚀 AMP 실행", type="primary", use_container_width=True):
-            if not mw_text and not uploaded_file:
-                st.warning("민원 내용 또는 첨부파일 중 하나는 필요합니다.")
-                st.stop()
+            # HTML은 "왼쪽 끝에 붙여서" 만들기(렌더링 안정)
+            html_parts = []
+            html_parts.append('<div class="paper-sheet">')
+            html_parts.append('<div class="stamp">직인생략</div>')
+            html_parts.append(f'<div class="doc-header">{doc.get("title","공 문 서")}</div>')
+            html_parts.append('<div class="doc-info">')
+            html_parts.append(f'<span>문서번호: {meta.get("doc_num","")}</span>')
+            html_parts.append(f'<span>시행일자: {meta.get("today_str","")}</span>')
+            html_parts.append(f'<span>수신: {doc.get("receiver","수신자 참조")}</span>')
+            html_parts.append(f'<span>부서: {doc.get("dept", st.session_state.get("dept",""))}</span>')
+            html_parts.append(f'<span>담당: {doc.get("officer", st.session_state.get("officer",""))}</span>')
+            html_parts.append("</div>")
+            html_parts.append('<hr style="border: 1px solid black; margin-bottom: 30px;">')
+            html_parts.append('<div class="doc-body">')
+            for p in paragraphs:
+                safe_p = (p or "").replace("<", "&lt;").replace(">", "&gt;")
+                html_parts.append(f"<p style='margin-bottom: 15px;'>{safe_p}</p>")
+            html_parts.append("</div>")
+            html_parts.append(f'<div class="doc-footer">{doc.get("department_head","행정기관장")}</div>')
+            html_parts.append("</div>")
 
-            with st.status("🔄 AMP 3단계 처리 중...", expanded=True) as status:
-                vision_text = "첨부 이미지 없음"
-                if uploaded_file is not None:
-                    vision_text = analyze_image_gemini(uploaded_file.getvalue())
-
-                # 실제 AMP 실행
-                result = run_amp(
-                    mw_text=mw_text,
-                    vision_text=vision_text,
-                    law_query=law_query,
-                    naver_query=naver_query,
-                    doc_type=doc_type,
-                )
-
-                st.session_state["result"] = result
-                status.update(label="✅ 완료", state="complete", expanded=False)
-
-    with col2:
-        st.subheader("📄 최종 결과")
-        if st.session_state.get("result"):
-            st.markdown("<div class='result-card'>", unsafe_allow_html=True)
-            st.markdown(st.session_state["result"])
-            st.markdown("</div>", unsafe_allow_html=True)
-            st.success("완료")
+            st.markdown("".join(html_parts), unsafe_allow_html=True)
         else:
-            st.info("왼쪽에서 실행하면 결과가 여기에 표시됩니다.")
+            st.markdown(
+                """
+<div style="text-align:center; padding:100px; color:#aaa; background:white; border-radius:10px; border:2px dashed #ddd;">
+  <h3>📄 Document Preview</h3>
+  <p>왼쪽에서 업무를 지시하면<br>완성된 공문서가 여기에 나타납니다.</p>
+</div>
+""",
+                unsafe_allow_html=True,
+            )
 
 
 if __name__ == "__main__":
