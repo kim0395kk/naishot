@@ -1,4 +1,9 @@
-# app.py — AI 행정관 Pro (LAWGO: 링크 클릭=원문 + NAVER 결과 파싱 고정 + 연관법령 3개 + JO 표시)
+# app.py — AI 행정관 Pro
+# ✅ (1) API 호출 수 + 토큰(가능한 범위) 사용량 표시
+# ✅ (2) NAVER 블로그/카페 “전문적인 내용만” 필터링 추가 (rule-based)
+# ✅ LAWGO(법제처 DRF) 대표+연관 법령 3개 + JO(6자리) + 원문 클릭
+# ✅ NAVER 뉴스/웹/블로그/카페 결과 “틀 밖 튐” 방지: 구조화 파싱 + 카드 렌더
+
 import streamlit as st
 import json
 import re
@@ -97,17 +102,16 @@ def mask_pii(text: str) -> str:
 
 
 def normalize_text(s: str) -> str:
-    """HTML/개행/과도한 공백 정리. '틀 밖 튐' 방지용."""
+    """HTML/개행/과도한 공백 정리."""
     if not s:
         return ""
-    s = re.sub(r"<.*?>", "", s)            # HTML tag 제거
+    s = re.sub(r"<.*?>", "", s)  # HTML tag 제거
     s = s.replace("&quot;", '"').replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-    s = re.sub(r"\s+", " ", s).strip()     # 공백 정리
+    s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
 def safe_url(u: str) -> str:
-    """link 필드에 이상한 값 들어와도 UI 안 터지게"""
     if not u:
         return ""
     u = u.strip()
@@ -116,29 +120,101 @@ def safe_url(u: str) -> str:
     return u
 
 
+def clamp(s: str, n: int = 300) -> str:
+    s = s or ""
+    return s if len(s) <= n else s[:n] + "…"
+
+
 # =========================================================
-# 3) Trace
+# 3) Meter / Trace (API 호출 수 + 토큰)
 # =========================================================
+class UsageMeter:
+    """
+    - 호출 수: api_name 카운트
+    - 토큰: provider별 합산 (Gemini/Groq에서만 가능한 범위)
+    """
+    def __init__(self):
+        self.calls = {}  # name -> int
+        self.tokens = {
+            "gemini_prompt": 0,
+            "gemini_output": 0,
+            "gemini_total": 0,
+            "groq_prompt": 0,
+            "groq_output": 0,
+            "groq_total": 0,
+        }
+
+    def inc_call(self, name: str):
+        self.calls[name] = self.calls.get(name, 0) + 1
+
+    def add_gemini_tokens(self, prompt: int | None, output: int | None, total: int | None):
+        if prompt is not None:
+            self.tokens["gemini_prompt"] += int(prompt)
+        if output is not None:
+            self.tokens["gemini_output"] += int(output)
+        if total is not None:
+            self.tokens["gemini_total"] += int(total)
+        else:
+            # total이 없으면 prompt+output으로 근사
+            if prompt is not None or output is not None:
+                self.tokens["gemini_total"] += int((prompt or 0) + (output or 0))
+
+    def add_groq_tokens(self, prompt: int | None, output: int | None, total: int | None):
+        if prompt is not None:
+            self.tokens["groq_prompt"] += int(prompt)
+        if output is not None:
+            self.tokens["groq_output"] += int(output)
+        if total is not None:
+            self.tokens["groq_total"] += int(total)
+        else:
+            if prompt is not None or output is not None:
+                self.tokens["groq_total"] += int((prompt or 0) + (output or 0))
+
+
 class Trace:
     def __init__(self):
         self.items = []
+        self.meter = UsageMeter()
 
-    def add(self, name, ok, detail=""):
-        self.items.append({"name": name, "ok": bool(ok), "detail": detail})
+    def add(self, name, ok, detail="", tokens: dict | None = None):
+        self.meter.inc_call(name)
+        row = {"name": name, "ok": bool(ok), "detail": detail}
+        if tokens:
+            row["tokens"] = tokens
+        self.items.append(row)
 
     def to_markdown(self):
         if not self.items:
             return "API 사용 내역이 없습니다."
-        lines = ["| API | 성공 | 상세 |", "|---|---:|---|"]
+        lines = ["| API | 성공 | 상세 | 토큰 |", "|---|---:|---|---|"]
         for it in self.items:
-            lines.append(f"| {it['name']} | {'✅' if it['ok'] else '❌'} | {it.get('detail','')} |")
+            tok = it.get("tokens")
+            tok_str = ""
+            if isinstance(tok, dict):
+                # p/o/t 형태 기대
+                p = tok.get("prompt")
+                o = tok.get("output")
+                t = tok.get("total")
+                tok_str = f"p={p}, o={o}, t={t}"
+            lines.append(f"| {it['name']} | {'✅' if it['ok'] else '❌'} | {it.get('detail','')} | {tok_str} |")
         return "\n".join(lines)
+
+    def usage_summary(self) -> dict:
+        return {"calls": self.meter.calls, "tokens": self.meter.tokens}
 
 
 # =========================================================
 # 4) Services
 # =========================================================
 class LLMService:
+    """
+    Gemini(텍스트/JSON) -> 실패 시 Groq fallback
+    secrets:
+      [general]
+      GEMINI_API_KEY
+      GROQ_API_KEY
+      GROQ_MODEL
+    """
     def __init__(self, trace: Trace):
         self.trace = trace
         g = st.secrets.get("general", {})
@@ -168,6 +244,31 @@ class LLMService:
         else:
             self.trace.add("Groq.init", False, "No key or lib missing")
 
+    @staticmethod
+    def _extract_gemini_tokens(res) -> tuple[int | None, int | None, int | None]:
+        """
+        google-generativeai의 응답 구조는 버전에 따라 다름.
+        가능한 케이스:
+          - res.usage_metadata.total_token_count 등
+          - res.usage_metadata.prompt_token_count / candidates_token_count
+        실패하면 (None,None,None)
+        """
+        try:
+            um = getattr(res, "usage_metadata", None)
+            if not um:
+                return (None, None, None)
+
+            # 후보 키들
+            total = getattr(um, "total_token_count", None)
+            prompt = getattr(um, "prompt_token_count", None)
+            # candidates_token_count 또는 response_token_count 류
+            output = getattr(um, "candidates_token_count", None)
+            if output is None:
+                output = getattr(um, "response_token_count", None)
+            return (prompt, output, total)
+        except Exception:
+            return (None, None, None)
+
     def _try_gemini_text(self, prompt: str):
         if not self._gemini_ready:
             raise RuntimeError("Gemini not ready")
@@ -176,7 +277,14 @@ class LLMService:
             try:
                 model = genai.GenerativeModel(m)
                 res = model.generate_content(prompt)
-                self.trace.add("Gemini.generate_content", True, f"model={m}")
+                p, o, t = self._extract_gemini_tokens(res)
+                self.trace.meter.add_gemini_tokens(p, o, t)
+                self.trace.add(
+                    "Gemini.generate_content",
+                    True,
+                    f"model={m}",
+                    tokens={"prompt": p, "output": o, "total": t},
+                )
                 return (res.text or "").strip()
             except Exception as e:
                 last = e
@@ -184,10 +292,13 @@ class LLMService:
         raise RuntimeError(last)
 
     def generate_text(self, prompt: str) -> str:
+        # Gemini 먼저
         try:
             return self._try_gemini_text(prompt)
         except Exception:
             pass
+
+        # Groq fallback
         if not self.groq_client:
             return "시스템 오류: LLM 연결 실패(Gemini/Groq 모두 불가)."
         try:
@@ -196,7 +307,17 @@ class LLMService:
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
             )
-            self.trace.add("Groq.chat.completions", True, f"model={self.groq_model}")
+            usage = getattr(completion, "usage", None)
+            p = getattr(usage, "prompt_tokens", None) if usage else None
+            o = getattr(usage, "completion_tokens", None) if usage else None
+            t = getattr(usage, "total_tokens", None) if usage else None
+            self.trace.meter.add_groq_tokens(p, o, t)
+            self.trace.add(
+                "Groq.chat.completions",
+                True,
+                f"model={self.groq_model}",
+                tokens={"prompt": p, "output": o, "total": t},
+            )
             return (completion.choices[0].message.content or "").strip()
         except Exception as e:
             self.trace.add("Groq.chat.completions", False, f"{type(e).__name__}: {e}")
@@ -214,6 +335,12 @@ class LLMService:
 
 
 class LawAPIService:
+    """
+    법제처 국가법령정보 DRF
+    secrets:
+      [general]
+      LAW_API_ID = OC
+    """
     BASE_SEARCH = "https://www.law.go.kr/DRF/lawSearch.do"
     BASE_SERVICE = "https://www.law.go.kr/DRF/lawService.do"
 
@@ -246,6 +373,7 @@ class LawAPIService:
         data = self._get_json(self.BASE_SEARCH, params, "LAWGO.lawSearch", "endpoint=lawSearch.do")
         if not isinstance(data, dict):
             return []
+
         candidates = []
         if isinstance(data.get("LawSearch"), dict) and isinstance(data["LawSearch"].get("law"), list):
             candidates = data["LawSearch"]["law"]
@@ -263,13 +391,11 @@ class LawAPIService:
                 continue
             law_name = item.get("법령명한글") or item.get("법령명_한글") or item.get("법령명") or ""
             mst = item.get("법령일련번호") or item.get("MST") or item.get("lsi_seq")
-            # 상세링크가 상대경로로 내려오는 경우가 있어 보정 (법제처 도메인 붙이기)
             link = item.get("법령상세링크") or ""
             if link and link.startswith("/"):
                 link = "https://www.law.go.kr" + link
             out.append({"law_name": str(law_name).strip(), "mst": str(mst) if mst else None, "link": str(link), "raw": item})
-        out = [x for x in out if x["law_name"]]
-        return out
+        return [x for x in out if x["law_name"]]
 
     def fetch_article(self, mst: str, jo6: str | None):
         params = {"OC": self.oc, "target": "law", "type": "JSON", "MST": mst}
@@ -300,13 +426,6 @@ class LawAPIService:
             v = data.get(key)
             if isinstance(v, str) and v.strip():
                 return v.strip()
-        try:
-            txt = json.dumps(data, ensure_ascii=False)
-            m = re.search(r'"조문내용"\s*:\s*"([^"]+)"', txt)
-            if m:
-                return m.group(1)
-        except Exception:
-            pass
         return ""
 
     def get_related_laws_pack(self, situation: str, llm: LLMService, topk: int = 3):
@@ -339,15 +458,14 @@ class LawAPIService:
                 continue
             ln = (x.get("law_name") or "").strip()
             ar = (x.get("article") or "").strip()
-            if not ln:
-                continue
-            if ln in seen:
+            if not ln or ln in seen:
                 continue
             seen.add(ln)
             cleaned.append({"law_name": ln, "article": ar})
             if len(cleaned) >= 8:
                 break
 
+        # 부족하면 상황 키워드로 보강
         if len(cleaned) < topk:
             kw = re.sub(r"\s+", " ", situation_m).strip()[:40]
             kw_results = self.search_law(kw, display=8)
@@ -383,7 +501,9 @@ class LawAPIService:
                 data = self.fetch_article(mst, jo6)
                 article_text = self._extract_article_text(data)
 
-            picked.append({"law_name": law_name, "article": ar, "jo6": jo6, "mst": mst, "link": link, "article_text": article_text})
+            picked.append(
+                {"law_name": law_name, "article": ar, "jo6": jo6, "mst": mst, "link": link, "article_text": article_text}
+            )
             if len(picked) >= topk:
                 break
 
@@ -396,6 +516,12 @@ class LawAPIService:
 
 
 class NaverSearchService:
+    """
+    secrets:
+      [naver]
+      CLIENT_ID
+      CLIENT_SECRET
+    """
     BASE = "https://openapi.naver.com/v1/search"
 
     def __init__(self, trace: Trace):
@@ -426,48 +552,123 @@ class NaverSearchService:
             self.trace.add(f"NAVER.{endpoint}", False, f"{type(e).__name__}: {e}")
             return None
 
+    # ---------- 전문성 필터(블로그/카페) ----------
+    _PRO_KEYWORDS = [
+        "법령", "시행령", "시행규칙", "조문", "제", "조", "판례", "행정심판", "행정소송",
+        "과태료", "처분", "사전통지", "의견제출", "이의신청", "불복", "유권해석", "질의회신",
+        "고시", "훈령", "예규", "지침", "매뉴얼", "가이드", "공공기관", "지자체", "공무원",
+        "법제처", "국가법령정보", "행정절차법"
+    ]
+    _NONPRO_KEYWORDS = [
+        "후기", "맛집", "일상", "여행", "다이어트", "브이로그", "내돈내산", "감성",
+        "연애", "육아", "행복", "고양이", "강아지", "음악", "카페투어", "리뷰"
+    ]
+
+    @classmethod
+    def _professional_score(cls, title: str, desc: str, link: str) -> int:
+        t = (title or "") + " " + (desc or "")
+        t_low = t.lower()
+
+        score = 0
+        # 법/행정 키워드
+        for k in cls._PRO_KEYWORDS:
+            if k in t:
+                score += 2
+
+        # 숫자+조/제 등 구조가 있으면 가점
+        if re.search(r"제?\s*\d+\s*조", t):
+            score += 4
+        if re.search(r"\b\d{4}\b", t):
+            score += 1
+
+        # 길이(너무 짧으면 비전문)
+        if len(desc or "") >= 80:
+            score += 1
+
+        # 비전문 키워드 감점
+        for k in cls._NONPRO_KEYWORDS:
+            if k in t:
+                score -= 4
+
+        # 이모지/ㅋㅋ 같은 감점
+        if re.search(r"[😂🤣😍😅]|ㅋㅋ|ㅎㅎ|ㅠㅠ", t):
+            score -= 2
+
+        # 링크가 공공/법 관련이면 가점 (블로그/카페도 링크에 출처가 섞이는 경우)
+        if any(dom in (link or "") for dom in ["law.go.kr", "moj.go.kr", "korea.kr", "go.kr", "ac.kr"]):
+            score += 3
+
+        return score
+
+    def _parse_items(self, data: dict, source: str) -> list[dict]:
+        out = []
+        if not data:
+            return out
+        for it in (data.get("items") or [])[:10]:
+            title = normalize_text(it.get("title", ""))
+            desc = normalize_text(it.get("description", "")) or normalize_text(it.get("snippet", ""))
+            link = safe_url(it.get("link", "") or "")
+            out.append(
+                {
+                    "source": source,
+                    "title": title or "(제목 없음)",
+                    "desc": clamp(desc, 320),
+                    "link": link,
+                }
+            )
+        # 링크/제목 중복 제거
+        uniq, seen = [], set()
+        for x in out:
+            key = x.get("link") or (x["source"] + x["title"])
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(x)
+        return uniq
+
     def search_precedents_parsed(self, situation: str) -> list[dict]:
         """
-        ✅ '사례 틀 벗어나는 문제' 해결:
-        - 네이버 응답(items)을 그대로 "구조화된 리스트"로 만든다
-        - HTML 제거/공백정리/URL 보정
-        - UI는 이 리스트를 카드로 렌더 → 절대 튀어나가지 않음
+        ✅ 뉴스/웹/블로그/카페를 구조화해서 반환
+        ✅ 블로그/카페는 '전문성 점수'로 필터링하여 전문적인 것만 추가
         """
-        q1 = f"{situation} 행정처분 사례"
-        q2 = f"{situation} 과태료 기준"
+        # 질의 템플릿
+        q_core = situation.strip()
+        q_news = f"{q_core} 행정처분 과태료"
+        q_web = f"{q_core} 법령 조문 기준"
+        q_blog = f"{q_core} 법령 해설 과태료 기준"
+        q_cafe = f"{q_core} 행정처분 질의회신 유권해석"
 
-        news = self._call("news", q1, display=5)
-        webkr = self._call("webkr", q2, display=5)
+        news = self._call("news", q_news, display=5)
+        webkr = self._call("webkr", q_web, display=5)
+
+        blog = self._call("blog", q_blog, display=10)          # ✅ 블로그
+        cafe = self._call("cafearticle", q_cafe, display=10)   # ✅ 카페
 
         out = []
+        out += self._parse_items(news, "news")
+        out += self._parse_items(webkr, "webkr")
 
-        def push_items(data, source):
-            if not data:
-                return
-            for it in (data.get("items") or [])[:5]:
-                title = normalize_text(it.get("title", ""))
-                desc = normalize_text(it.get("description", "")) or normalize_text(it.get("snippet", ""))
-                link = safe_url(it.get("link", "") or "")
-                pub = normalize_text(it.get("originallink", "")) if source == "news" else ""
-                # 너무 긴 문자열은 UI 안전하게 자르기
-                if len(desc) > 300:
-                    desc = desc[:300] + "…"
-                out.append(
-                    {
-                        "source": source,
-                        "title": title or "(제목 없음)",
-                        "desc": desc,
-                        "link": link,
-                        "extra": pub,
-                    }
-                )
+        # 블로그/카페는 전문성 필터
+        blog_items = self._parse_items(blog, "blog")
+        cafe_items = self._parse_items(cafe, "cafe")
 
-        push_items(news, "news")
-        push_items(webkr, "webkr")
+        def filter_pro(items, limit):
+            scored = []
+            for x in items:
+                s = self._professional_score(x["title"], x["desc"], x["link"])
+                x2 = dict(x)
+                x2["score"] = s
+                scored.append(x2)
+            # 점수 기준(최소 4점 이상만 통과) + 상위 limit
+            scored = [x for x in scored if x["score"] >= 4]
+            scored.sort(key=lambda z: z["score"], reverse=True)
+            return scored[:limit]
 
-        # 중복 링크 제거
-        uniq = []
-        seen = set()
+        out += filter_pro(blog_items, limit=3)  # ✅ 전문적인 블로그만
+        out += filter_pro(cafe_items, limit=3)  # ✅ 전문적인 카페만
+
+        # 최종 중복 제거(다시)
+        uniq, seen = [], set()
         for x in out:
             key = x.get("link") or (x["source"] + x["title"])
             if key in seen:
@@ -478,6 +679,12 @@ class NaverSearchService:
 
 
 class DatabaseService:
+    """
+    secrets:
+      [supabase]
+      SUPABASE_URL
+      SUPABASE_KEY
+    """
     def __init__(self, trace: Trace):
         self.trace = trace
         self.is_active = False
@@ -531,10 +738,12 @@ class LegalAgents:
             rel_lines.append(f"{i}) {nm} {ar} (MST={mst}, JO={jo6})")
         rel_block = "\n".join(rel_lines) if rel_lines else "(없음)"
 
-        # 네이버 결과를 "짧은 텍스트"로만 요약해 LLM 입력 폭주 방지
         brief = []
-        for it in (precedent_items or [])[:6]:
-            brief.append(f"- [{it.get('source')}] {it.get('title')}: {it.get('desc')}")
+        for it in (precedent_items or [])[:8]:
+            src = it.get("source")
+            title = it.get("title")
+            desc = it.get("desc")
+            brief.append(f"- [{src}] {title}: {desc}")
         brief_block = "\n".join(brief) if brief else "(검색 결과 없음)"
 
         prompt = f"""
@@ -552,7 +761,7 @@ MST={primary.get("mst")} / JO={primary.get("jo6")}
 [연관 법령 3개]
 {rel_block}
 
-[유사 사례(네이버 검색 요약)]
+[유사 사례(네이버: 뉴스/웹 + 전문 블로그/카페만)]
 {brief_block}
 
 아래 3개 항목을 마크다운으로:
@@ -676,13 +885,13 @@ def run_workflow(user_input: str):
     def add_log(msg, style="sys"):
         logs.append(f"<div class='agent-log log-{style}'>{escape(msg)}</div>")
         log_placeholder.markdown("".join(logs), unsafe_allow_html=True)
-        time.sleep(0.18)
+        time.sleep(0.16)
 
     add_log("🔍 Phase 1: 법령 API(법제처)로 대표+연관 법령 3개 찾는 중...", "legal")
     laws_pack = law_api.get_related_laws_pack(user_input, llm, topk=3)
     add_log(f"📜 대표 근거: {laws_pack.get('legal_basis_text','')}", "legal")
 
-    add_log("🔎 Phase 1b: 네이버 검색 API → 구조화 파싱 중...", "search")
+    add_log("🔎 Phase 1b: 네이버 검색(뉴스/웹 + 전문 블로그/카페만) 파싱 중...", "search")
     precedent_items = naver.search_precedents_parsed(user_input)
 
     add_log("🧠 Phase 2: 업무 처리 방향 수립 중...", "strat")
@@ -705,6 +914,7 @@ def run_workflow(user_input: str):
                 "strategy": strategy,
                 "document_content": doc_data,
                 "api_trace": trace.items,
+                "usage_summary": trace.usage_summary(),  # ✅ 호출 수 + 토큰 합계 저장
             },
             ensure_ascii=False,
         ),
@@ -712,7 +922,7 @@ def run_workflow(user_input: str):
     save_msg = db.save_log("law_reports", payload)
 
     add_log(f"✅ 완료: {save_msg}", "sys")
-    time.sleep(0.5)
+    time.sleep(0.45)
     log_placeholder.empty()
 
     return {
@@ -724,6 +934,7 @@ def run_workflow(user_input: str):
         "save_msg": save_msg,
         "api_trace": trace.items,
         "api_trace_md": trace.to_markdown(),
+        "usage_summary": trace.usage_summary(),
     }
 
 
@@ -739,25 +950,48 @@ def render_api_trace(trace_items):
         cls = "api-pill api-ok" if it.get("ok") else "api-pill api-bad"
         name = escape(str(it.get("name", "")))
         detail = escape(str(it.get("detail", "")))
-        pills.append(f"<span class='{cls}' title='{detail}'>{name}</span>")
+        tok = it.get("tokens")
+        tok_str = ""
+        if isinstance(tok, dict):
+            tok_str = f" | tokens p={tok.get('prompt')}, o={tok.get('output')}, t={tok.get('total')}"
+        pills.append(f"<span class='{cls}' title='{detail}{tok_str}'>{name}</span>")
     st.markdown(
-        f"<div class='api-box'>{''.join(pills)}<div class='small-muted'>*pill을 누르면(또는 PC는 hover) 상세 표시</div></div>",
+        f"<div class='api-box'>{''.join(pills)}<div class='small-muted'>*pill hover/길게눌러 상세(토큰 포함)</div></div>",
         unsafe_allow_html=True,
     )
 
 
+def render_usage_summary(usage: dict):
+    """
+    ✅ (1) API 호출 수 + 토큰 사용량 표시
+    """
+    calls = (usage or {}).get("calls", {}) or {}
+    tokens = (usage or {}).get("tokens", {}) or {}
+
+    # 호출 수 표
+    st.markdown("#### 📞 API 호출 수")
+    if calls:
+        rows = [{"API": k, "Calls": v} for k, v in sorted(calls.items(), key=lambda x: (-x[1], x[0]))]
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+    else:
+        st.info("호출 기록이 없습니다.")
+
+    # 토큰 표
+    st.markdown("#### 🧾 토큰 사용량(가능한 범위)")
+    t_rows = [
+        {"Provider": "Gemini", "Prompt": tokens.get("gemini_prompt", 0), "Output": tokens.get("gemini_output", 0), "Total": tokens.get("gemini_total", 0)},
+        {"Provider": "Groq", "Prompt": tokens.get("groq_prompt", 0), "Output": tokens.get("groq_output", 0), "Total": tokens.get("groq_total", 0)},
+    ]
+    st.dataframe(t_rows, use_container_width=True, hide_index=True)
+    st.caption("※ Gemini 토큰은 라이브러리/응답 버전에 따라 미제공(None)일 수 있으며, 제공될 때만 합산됩니다.")
+
+
 def law_link_from_meta(link: str, mst: str | None, jo6: str | None, oc: str | None) -> str:
-    """
-    1) API에서 내려온 link(법령상세링크)가 있으면 그걸 우선 사용
-    2) 없으면 lawService HTML 링크를 만들어서 원문으로 연결
-    """
     link = safe_url(link)
     if link:
         return link
-
     if not (mst and oc):
         return ""
-    # 법제처 원문(HTML) 보기: lawService.do?OC=...&target=law&MST=...&type=HTML (&JO=...)
     base = f"https://www.law.go.kr/DRF/lawService.do?OC={oc}&target=law&MST={mst}&type=HTML"
     if jo6:
         base += f"&JO={jo6}"
@@ -783,10 +1017,8 @@ def render_laws_pack(laws_pack: dict):
 
         full_url = law_link_from_meta(link, mst, jo6, oc)
 
-        # ✅ 1) 법령 제목 자체를 "클릭 링크"로
         if full_url:
             st.markdown(f"### {idx}) [{escape(nm)} {escape(ar)}]({full_url})")
-            # 모바일에서 더 잘 눌리게 버튼도 추가
             st.link_button(f"🔗 원문 보기 - {idx}", full_url, use_container_width=True)
         else:
             st.markdown(f"### {idx}) {escape(nm)} {escape(ar)}")
@@ -802,25 +1034,34 @@ def render_laws_pack(laws_pack: dict):
 
 
 def render_precedents(items: list[dict]):
-    """
-    ✅ 2) '사례 틀 벗어남' 방지:
-    - 마크다운으로 긴 URL/특수문자/HTML 넣지 않고
-    - 카드 형태로 title/desc/link를 안정적으로 렌더
-    """
     if not items:
         st.info("관련 검색 결과가 없습니다.")
         return
 
-    for it in items[:10]:
+    def src_label(src: str) -> str:
+        return {
+            "news": "뉴스",
+            "webkr": "웹문서",
+            "blog": "블로그(전문필터)",
+            "cafe": "카페(전문필터)",
+        }.get(src, src or "검색")
+
+    for it in items[:14]:
         src = it.get("source", "")
         title = it.get("title", "")
         desc = it.get("desc", "")
         link = safe_url(it.get("link", "") or "")
-
-        src_label = "뉴스" if src == "news" else "웹문서"
+        score = it.get("score", None)
 
         st.markdown("<div class='item-card'>", unsafe_allow_html=True)
-        st.markdown(f"<div class='item-title'>[{src_label}] {escape(title)}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='item-title'>[{escape(src_label(src))}] {escape(title)}</div>", unsafe_allow_html=True)
+
+        meta = []
+        if isinstance(score, int) and src in ("blog", "cafe"):
+            meta.append(f"score={score}")
+        if meta:
+            st.markdown(f"<div class='item-meta'>{escape(' | '.join(meta))}</div>", unsafe_allow_html=True)
+
         st.markdown(f"<div class='item-desc'>{escape(desc)}</div>", unsafe_allow_html=True)
         if link:
             st.link_button("열기", link, use_container_width=True)
@@ -832,7 +1073,7 @@ def main():
 
     with col_left:
         st.title("🏢 AI 행정관 Pro")
-        st.caption("LAWGO(법제처 DRF) + NAVER Search + Gemini→Groq + Supabase")
+        st.caption("LAWGO(법제처 DRF) + NAVER(뉴스/웹/전문 블로그·카페) + Gemini→Groq + Supabase")
         st.markdown("---")
 
         st.markdown("### 🗣️ 업무 지시")
@@ -862,14 +1103,17 @@ def main():
             else:
                 st.warning(res.get("save_msg", "DB 미연결"))
 
-            with st.expander("🔌 [표시] 이번 업무에서 사용한 API", expanded=True):
+            with st.expander("📊 [표시] 호출 수 / 토큰 사용량", expanded=True):
+                render_usage_summary(res.get("usage_summary", {}))
+
+            with st.expander("🔌 [표시] 이번 업무에서 사용한 API (상세)", expanded=False):
                 render_api_trace(res.get("api_trace", []))
                 st.markdown(res.get("api_trace_md", ""))
 
             with st.expander("✅ [검토] 법령(법제처 API) — 제목 클릭=원문 보기", expanded=True):
                 render_laws_pack(res.get("laws_pack", {}))
 
-            with st.expander("🔎 [검토] 유사 사례(네이버 검색 API) — 파싱 고정", expanded=True):
+            with st.expander("🔎 [검토] 유사 사례(네이버) — 전문 블로그/카페만 추가", expanded=True):
                 render_precedents(res.get("precedent_items", []))
 
             with st.expander("🧭 [방향] 업무 처리 가이드라인", expanded=True):
