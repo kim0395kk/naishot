@@ -5,3 +5,4 @@ smolagents
 supabase
 requests
 Pillow
+duckduckgo-search
