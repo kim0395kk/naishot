@@ -135,17 +135,58 @@ class LLMService:
 
 class SearchService:
     """
-    ✅ Naver Search OpenAPI Wrapper (Web + News)
-    - Uses NAVER_CLIENT_ID / NAVER_CLIENT_SECRET in st.secrets["general"]
+    ✅ Naver Search OpenAPI Wrapper (Web + News) + 강력 정제 필터
+    - webkr/news 결과를 합쳐서:
+      1) 도메인 화이트리스트 가점
+      2) 도메인 블랙리스트 강제 제외
+      3) 실무 키워드 포함 여부로 점수화
+      4) 상위 N개만 반환
     """
     def __init__(self):
         g = st.secrets.get("general", {})
         self.client_id = g.get("NAVER_CLIENT_ID")
         self.client_secret = g.get("NAVER_CLIENT_SECRET")
 
-        # 엔드포인트
         self.web_url = "https://openapi.naver.com/v1/search/webkr.json"
         self.news_url = "https://openapi.naver.com/v1/search/news.json"
+
+        # ✅ “정제된 데이터”에 가까운 도메인 위주(가점)
+        self.whitelist_domains = [
+            "law.go.kr",        # 국가법령정보센터
+            "scourt.go.kr",     # 대법원
+            "acrc.go.kr",       # 국민권익위(행정심판/민원)
+            "korea.kr",         # 대한민국 정책브리핑/정부
+            "go.kr",            # 지자체/정부기관
+            "moj.go.kr",        # 법무부
+            "police.go.kr",     # 경찰청
+            "kgsp.go.kr",       # 법제처/유사기관 케이스 대비(있으면)
+        ]
+
+        # ❌ 뻘소리 양산 도메인(강제 제외)
+        self.blacklist_domains = [
+            "blog.naver.com",
+            "m.blog.naver.com",
+            "cafe.naver.com",
+            "m.cafe.naver.com",
+            "post.naver.com",
+            "m.post.naver.com",
+            "tistory.com",
+            "brunch.co.kr",
+            "youtube.com",
+            "youtu.be",
+            "instagram.com",
+            "facebook.com",
+            "namu.wiki",
+        ]
+
+        # ✅ 실무형 문서에 자주 등장하는 단서(가점/필터)
+        self.signal_keywords = [
+            "행정심판", "재결", "처분", "과태료", "이행명령",
+            "사전통지", "의견제출", "청문", "행정절차법",
+            "판결", "판례", "대법원", "조례", "시행규칙",
+            "고시", "훈령", "예규", "지침", "업무처리",
+            "공고", "공시송달"
+        ]
 
     def _headers(self):
         return {
@@ -154,63 +195,153 @@ class SearchService:
         }
 
     def _clean_html(self, s: str) -> str:
-        # Naver는 title/description에 <b> 태그가 섞여 나옴 -> 제거
         if not s:
             return ""
         s = re.sub(r"<\/?b>", "", s)
         s = re.sub(r"<[^>]+>", "", s)
         return s.strip()
 
-    def _naver_search(self, url: str, query: str, display: int = 3):
+    def _naver_search(self, url: str, query: str, display: int = 5):
         params = {
             "query": query,
             "display": display,
             "start": 1,
-            "sort": "sim",  # 유사도
+            "sort": "sim",
         }
         r = requests.get(url, headers=self._headers(), params=params, timeout=10)
         r.raise_for_status()
         return r.json()
 
-    def search_precedents(self, situation: str) -> str:
+    def _get_domain(self, link: str) -> str:
+        # 링크에서 도메인만 추출 (정규식 간단 추출)
+        if not link:
+            return ""
+        m = re.search(r"https?://([^/]+)", link)
+        return (m.group(1).lower() if m else "").strip()
+
+    def _is_blacklisted(self, domain: str) -> bool:
+        d = domain.lower()
+        for bad in self.blacklist_domains:
+            if bad in d:
+                return True
+        return False
+
+    def _whitelist_score(self, domain: str) -> int:
+        d = domain.lower()
+        score = 0
+        for good in self.whitelist_domains:
+            if good == "go.kr":
+                # go.kr은 하위 도메인이 많으니 포함 검사
+                if d.endswith(".go.kr") or d == "go.kr" or ".go.kr" in d:
+                    score += 8
+            else:
+                if good in d:
+                    score += 10
+        return score
+
+    def _keyword_score(self, text: str) -> int:
+        t = (text or "").lower()
+        score = 0
+        for kw in self.signal_keywords:
+            if kw.lower() in t:
+                score += 2
+        return score
+
+    def _score_item(self, title: str, desc: str, link: str) -> int:
+        domain = self._get_domain(link)
+
+        # 블랙리스트면 탈락
+        if self._is_blacklisted(domain):
+            return -999
+
+        score = 0
+
+        # 화이트리스트 가점
+        score += self._whitelist_score(domain)
+
+        # 제목/설명 키워드 가점
+        score += self._keyword_score(title) * 2
+        score += self._keyword_score(desc)
+
+        # 너무 짧은 설명은 감점 (의미없는 결과가 많음)
+        if len((desc or "").strip()) < 25:
+            score -= 3
+
+        # 링크가 http(s) 아닌 경우 감점
+        if not (link or "").startswith("http"):
+            score -= 5
+
+        return score
+
+    def _build_query(self, situation: str) -> str:
+        # 입력을 너무 길게 넣으면 검색 품질이 떨어짐
+        q_core = re.sub(r"\s+", " ", (situation or "").strip())
+        if len(q_core) > 80:
+            q_core = q_core[:80] + "..."
+
+        # ✅ 네이버에서도 어느 정도 먹히는 "공식문서" 유도 쿼리
+        # (완벽한 site: 필터는 아니지만 효과 있음)
+        official_hint = "(site:go.kr OR site:law.go.kr OR site:scourt.go.kr OR site:acrc.go.kr OR site:korea.kr)"
+        intent_hint = "(행정심판 OR 재결 OR 판례 OR 처분 OR 과태료 OR 이행명령 OR 사전통지 OR 청문 OR 조례)"
+
+        query = f"{q_core} {intent_hint} {official_hint}"
+        return query
+
+    def search_precedents(self, situation: str, top_k: int = 5) -> str:
         if not self.client_id or not self.client_secret:
             return "⚠️ 네이버 검색 API 키(NAVER_CLIENT_ID / NAVER_CLIENT_SECRET)가 없어 유사 사례를 조회할 수 없습니다."
 
         try:
-            # 질의어 구성(원문을 너무 길게 넣으면 품질 떨어짐)
-            q_core = situation.strip()
-            q_core = re.sub(r"\s+", " ", q_core)
-            if len(q_core) > 80:
-                q_core = q_core[:80] + "..."
+            query = self._build_query(situation)
 
-            # 실무용 키워드 보강
-            query = f"{q_core} 행정처분 판례 사례 민원 답변"
+            # web + news 넉넉히 가져온 다음 필터링
+            web = self._naver_search(self.web_url, query, display=10)
+            news = self._naver_search(self.news_url, query, display=10)
 
-            web = self._naver_search(self.web_url, query, display=3)
-            news = self._naver_search(self.news_url, query, display=3)
+            merged = []
+            for src_name, payload in [("웹", web), ("뉴스", news)]:
+                for it in (payload.get("items", []) or []):
+                    title = self._clean_html(it.get("title", "제목 없음"))
+                    desc = self._clean_html(it.get("description", "내용 없음"))
+                    link = it.get("link", "#")
 
+                    score = self._score_item(title, desc, link)
+                    if score <= -100:
+                        continue  # 블랙리스트/불량
+                    merged.append({
+                        "src": src_name,
+                        "title": title,
+                        "desc": desc,
+                        "link": link,
+                        "score": score,
+                        "domain": self._get_domain(link)
+                    })
+
+            if not merged:
+                return "관련된 유사 사례 검색 결과가 없습니다. (정제 필터 적용 후 결과가 비었습니다)"
+
+            # 점수 순 정렬 + 중복 링크 제거
+            merged.sort(key=lambda x: x["score"], reverse=True)
+            seen = set()
+            picked = []
+            for it in merged:
+                if it["link"] in seen:
+                    continue
+                seen.add(it["link"])
+                picked.append(it)
+                if len(picked) >= top_k:
+                    break
+
+            # 출력: 공식/비공식 분리 느낌으로 표기
             lines = []
-
-            web_items = web.get("items", []) or []
-            if web_items:
-                lines.append("**[네이버 웹문서]**")
-                for it in web_items:
-                    title = self._clean_html(it.get("title", "제목 없음"))
-                    desc = self._clean_html(it.get("description", "내용 없음"))
-                    link = it.get("link", "#")
-                    lines.append(f"- **[{title}]({link})**: {desc}")
-
-            news_items = news.get("items", []) or []
-            if news_items:
-                lines.append("\n**[네이버 뉴스]**")
-                for it in news_items:
-                    title = self._clean_html(it.get("title", "제목 없음"))
-                    desc = self._clean_html(it.get("description", "내용 없음"))
-                    link = it.get("link", "#")
-                    lines.append(f"- **[{title}]({link})**: {desc}")
-
-            if not lines:
-                return "관련된 유사 사례 검색 결과가 없습니다."
+            lines.append(f"**[네이버 정제 결과 Top {len(picked)}]**")
+            for it in picked:
+                title = it["title"]
+                link = it["link"]
+                desc = it["desc"]
+                domain = it["domain"]
+                src = it["src"]
+                lines.append(f"- ({src}) **[{title}]({link})** `[{domain}]` : {desc}")
 
             return "\n".join(lines)
 
