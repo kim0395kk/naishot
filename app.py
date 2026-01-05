@@ -416,7 +416,7 @@ def main():
 
     with col_left:
         st.title("🏢 AI 행정관 Pro")
-        st.caption("Gemini + Naver Search + Strategy + DB")
+        st.caption("Gemini + 국가법령정보 + Naver Search + Strategy + DB")
         st.markdown("---")
 
         st.markdown("### 🗣️ 업무 지시")
@@ -427,7 +427,7 @@ def main():
             label_visibility="collapsed",
         )
 
-        if st.button("⚡ 스마트 행정 처분 시작", type="primary", use_container_width=True):
+        if st.button("⚡ 스마트 분석 시작", type="primary", use_container_width=True):
             if not user_input:
                 st.warning("내용을 입력해주세요.")
             else:
