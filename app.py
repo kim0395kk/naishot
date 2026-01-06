@@ -517,8 +517,8 @@ def main():
     col_left, col_right = st.columns([1, 1.2])
 
     with col_left:
-        st.title("🏢 AI 행정관 Pro")
-        st.caption("Gemini + 국가법령정보 + Naver Search + Strategy + DB")
+        st.title("🏢 AI 행정관 Pro 충주시청")
+        st.caption("문의 kim0395kk@korea.kr Gemini + 국가법령정보 + Naver Search + Strategy + DB")
         st.markdown("---")
 
         st.markdown("### 🗣️ 업무 지시")
