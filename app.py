@@ -395,11 +395,66 @@ st.markdown(
     div[data-testid="stSidebar"] {
         background: white;
         border-right: 1px solid var(--neutral-200);
+        min-width: 60px !important;
+        max-width: 800px !important;
+        resize: horizontal !important;
+        overflow: auto !important;
+        transition: width 0.1s ease;
+    }
+    
+    /* 사이드바 내부 영역 */
+    section[data-testid="stSidebar"] > div {
+        min-width: 60px !important;
     }
     
     /* 사이드바 접기 버튼 숨기기 */
-    button[data-testid="stSidebarCollapseButton"] {
+    button[data-testid="stSidebarCollapseButton"],
+    div[data-testid="stSidebarCollapsedControl"],
+    button[data-testid="baseButton-headerNoPadding"] {
         display: none !important;
+        visibility: hidden !important;
+        pointer-events: none !important;
+    }
+    
+    /* 사이드바 항상 표시 강제 */
+    section[data-testid="stSidebar"] {
+        display: block !important;
+        visibility: visible !important;
+        opacity: 1 !important;
+        transform: none !important;
+        left: 0 !important;
+        min-width: 60px !important;
+    }
+    
+    /* 접힌 상태에서도 최소 너비 유지 (한 글자 이상) */
+    section[data-testid="stSidebar"][aria-expanded="false"] {
+        width: 60px !important;
+        min-width: 60px !important;
+        transform: translateX(0) !important;
+    }
+    
+    /* 사이드바 리사이즈 핸들 스타일 (우측 드래그 영역) */
+    div[data-testid="stSidebar"]::after {
+        content: '⋮';
+        position: absolute;
+        right: 0;
+        top: 50%;
+        transform: translateY(-50%);
+        width: 12px;
+        height: 60px;
+        cursor: ew-resize;
+        background: linear-gradient(90deg, transparent, rgba(59, 130, 246, 0.1));
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 14px;
+        color: var(--neutral-400);
+        border-radius: 0 4px 4px 0;
+    }
+    
+    div[data-testid="stSidebar"]:hover::after {
+        background: linear-gradient(90deg, transparent, rgba(59, 130, 246, 0.3));
+        color: var(--primary-600);
     }
     
     div[data-testid="stSidebar"] button[kind="secondary"] {
