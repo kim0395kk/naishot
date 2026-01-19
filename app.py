@@ -1807,40 +1807,47 @@ def run_workflow(user_input: str, log_placeholder, mode: str = "신속") -> dict
 
 
 # =========================================================
-# 5) DB OPS (FINAL FIXED VERSION)
+# 5) DB OPS (HYBRID CHECK VERSION)
 # =========================================================
 def db_insert_archive(sb, prompt: str, payload: dict) -> Optional[str]:
     archive_id = str(uuid.uuid4())
     anon_id = str(ensure_anon_session_id())
 
-    # [수정] session_state 대신 서버(Supabase)에서 직접 유저 정보 확인
-    # 로그인 직후 0.1초 만에 저장해도 이메일이 누락되지 않도록 방지
+    # ---------------------------------------------------------
+    # [최종 수정] 서버(sb)와 메모장(session)을 모두 뒤져서 이메일 찾아냄
+    # ---------------------------------------------------------
+    # 1. 서버(Supabase)에게 먼저 물어봄
     user = get_auth_user(sb)
-    
-    real_user_id = None
-    real_user_email = None
+    server_email = None
+    server_user_id = None
 
     if user:
-        # user 객체가 딕셔너리일 수도, 객체일 수도 있어서 안전하게 처리
         if isinstance(user, dict):
-             real_user_id = user.get("id")
-             real_user_email = user.get("email")
+             server_user_id = user.get("id")
+             server_email = user.get("email")
         else:
-             real_user_id = getattr(user, "id", None)
-             real_user_email = getattr(user, "email", None)
+             server_user_id = getattr(user, "id", None)
+             server_email = getattr(user, "email", None)
 
-    # 이메일이 실제로 존재해야 로그인 상태로 간주
-    is_logged_in = bool(real_user_email)
+    # 2. 메모장(Session State)도 확인 (로그인 직후 서버가 느릴 때 대비)
+    session_email = st.session_state.get("user_email")
+    
+    # 3. [판결] 둘 중 하나라도 이메일이 있으면 그것을 사용
+    # (서버에서 가져온 게 있으면 우선 사용, 없으면 세션 정보 사용)
+    final_email = server_email if server_email else session_email
+    final_user_id = server_user_id # ID는 없어도 RLS 작동엔 문제 없음
+    
+    # ---------------------------------------------------------
 
     row = {
         "id": archive_id,
         "prompt": prompt,
         "payload": payload,
         "anon_session_id": anon_id,
-        "user_id": real_user_id,
+        "user_id": final_user_id,
         
-        # [핵심] 변수명은 real_...이지만, DB 컬럼명인 "user_email"에 맞춰서 넣음 -> 충돌 없음!
-        "user_email": (real_user_email.strip() if real_user_email else None),
+        # ★ [핵심] 찾아낸 최종 이메일을 넣음
+        "user_email": (final_email.strip() if final_email else None),
         
         "client_meta": {"app_ver": APP_VERSION},
         "app_mode": payload.get("app_mode", st.session_state.get("app_mode", "신속")),
@@ -1851,9 +1858,8 @@ def db_insert_archive(sb, prompt: str, payload: dict) -> Optional[str]:
     }
 
     try:
-        # 헤더 전송 (비로그인 시 본인 확인용, 로그인 시에도 안전장치)
+        # 헤더 전송
         sb.postgrest.headers.update({'x-session-id': anon_id})
-        
         sb.table("work_archive").insert(row).execute()
         return archive_id
     except Exception as e:
@@ -1863,7 +1869,6 @@ def db_insert_archive(sb, prompt: str, payload: dict) -> Optional[str]:
 
 def db_fetch_history(sb, limit: int = 80) -> List[dict]:
     anon_id = str(ensure_anon_session_id())
-    # 조회 시 헤더 전송
     sb.postgrest.headers.update({'x-session-id': anon_id})
 
     try:
@@ -1880,7 +1885,6 @@ def db_fetch_history(sb, limit: int = 80) -> List[dict]:
 
 def db_fetch_payload(sb, archive_id: str) -> Optional[dict]:
     anon_id = str(ensure_anon_session_id())
-    # 상세 조회 시 헤더 전송
     sb.postgrest.headers.update({'x-session-id': anon_id})
 
     try:
@@ -1900,7 +1904,6 @@ def db_fetch_payload(sb, archive_id: str) -> Optional[dict]:
 
 def db_fetch_followups(sb, archive_id: str) -> List[dict]:
     anon_id = str(ensure_anon_session_id())
-    # 후속질문 조회 시 헤더 전송
     sb.postgrest.headers.update({'x-session-id': anon_id})
 
     try:
@@ -1918,32 +1921,33 @@ def db_fetch_followups(sb, archive_id: str) -> List[dict]:
 def db_insert_followup(sb, archive_id: str, turn: int, role: str, content: str):
     anon_id = str(ensure_anon_session_id())
     
-    # [수정] 후속 질문도 안전하게 서버 정보 확인 (일관성 유지)
+    # [수정] 후속 질문도 동일하게 양쪽 확인
     user = get_auth_user(sb)
-    real_user_id = None
-    real_user_email = None
+    server_email = None
+    server_user_id = None
 
     if user:
         if isinstance(user, dict):
-             real_user_id = user.get("id")
-             real_user_email = user.get("email")
+             server_user_id = user.get("id")
+             server_email = user.get("email")
         else:
-             real_user_id = getattr(user, "id", None)
-             real_user_email = getattr(user, "email", None)
+             server_user_id = getattr(user, "id", None)
+             server_email = getattr(user, "email", None)
     
-    # 여기서는 is_logged_in 변수 자체는 안 쓰이지만 로직 통일성을 위해 유지
-    
+    session_email = st.session_state.get("user_email")
+    final_email = server_email if server_email else session_email
+    final_user_id = server_user_id
+
     row = {
         "archive_id": archive_id,
         "turn": turn,
         "role": role,
         "content": content,
-        "user_id": real_user_id,
-        "user_email": (real_user_email.strip() if real_user_email else None),
+        "user_id": final_user_id,
+        "user_email": (final_email.strip() if final_email else None),
         "anon_session_id": anon_id,
     }
     try:
-        # 후속질문 저장 시 헤더 전송
         sb.postgrest.headers.update({'x-session-id': anon_id})
         sb.table("work_followups").insert(row).execute()
     except Exception:
