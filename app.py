@@ -1807,22 +1807,21 @@ def run_workflow(user_input: str, log_placeholder, mode: str = "신속") -> dict
 
 
 # =========================================================
-# 5) DB OPS (FIXED FOR RLS HEADERS)
+# 5) DB OPS (FINAL FIXED VERSION)
 # =========================================================
 def db_insert_archive(sb, prompt: str, payload: dict) -> Optional[str]:
     archive_id = str(uuid.uuid4())
     anon_id = str(ensure_anon_session_id())
 
-    # ---------------------------------------------------------
-    # [변경된 부분 시작] session_state 대신 실시간 user 정보 확인
-    # ---------------------------------------------------------
+    # [수정] session_state 대신 서버(Supabase)에서 직접 유저 정보 확인
+    # 로그인 직후 0.1초 만에 저장해도 이메일이 누락되지 않도록 방지
     user = get_auth_user(sb)
     
     real_user_id = None
     real_user_email = None
 
     if user:
-        # user가 딕셔너리인지 객체인지 확인해서 안전하게 값 추출
+        # user 객체가 딕셔너리일 수도, 객체일 수도 있어서 안전하게 처리
         if isinstance(user, dict):
              real_user_id = user.get("id")
              real_user_email = user.get("email")
@@ -1832,16 +1831,18 @@ def db_insert_archive(sb, prompt: str, payload: dict) -> Optional[str]:
 
     # 이메일이 실제로 존재해야 로그인 상태로 간주
     is_logged_in = bool(real_user_email)
+
     row = {
-        "id": archive_id,  # ✅ 핵심
+        "id": archive_id,
         "prompt": prompt,
         "payload": payload,
         "anon_session_id": anon_id,
-        "user_id": user_id if is_logged_in else None,
-        # 빈 문자열("")이 아니라 None으로 들어가야 비로그인 로직이 작동합니다.
-        "user_email": (user_email.strip() if user_email else None),
+        "user_id": real_user_id,
+        
+        # [핵심] 변수명은 real_...이지만, DB 컬럼명인 "user_email"에 맞춰서 넣음 -> 충돌 없음!
+        "user_email": (real_user_email.strip() if real_user_email else None),
+        
         "client_meta": {"app_ver": APP_VERSION},
-
         "app_mode": payload.get("app_mode", st.session_state.get("app_mode", "신속")),
         "search_count": int(payload.get("search_count") or 0),
         "execution_time": float(payload.get("execution_time") or 0.0),
@@ -1850,20 +1851,19 @@ def db_insert_archive(sb, prompt: str, payload: dict) -> Optional[str]:
     }
 
     try:
-        # ★ [핵심 수정] 저장할 때 헤더에 세션 ID를 실어 보냅니다 (RLS 통과용)
-        # 이걸 안 보내면 DB가 "누구세요?" 하고 튕겨냅니다.
+        # 헤더 전송 (비로그인 시 본인 확인용, 로그인 시에도 안전장치)
         sb.postgrest.headers.update({'x-session-id': anon_id})
         
         sb.table("work_archive").insert(row).execute()
-        return archive_id 
+        return archive_id
     except Exception as e:
         st.warning(f"ℹ️ DB 저장 실패: {e}")
         return None
 
 
 def db_fetch_history(sb, limit: int = 80) -> List[dict]:
-    # ★ [핵심 수정] 조회할 때도 "나 이 세션 주인이요" 하고 헤더 제출
     anon_id = str(ensure_anon_session_id())
+    # 조회 시 헤더 전송
     sb.postgrest.headers.update({'x-session-id': anon_id})
 
     try:
@@ -1879,8 +1879,8 @@ def db_fetch_history(sb, limit: int = 80) -> List[dict]:
         return []
 
 def db_fetch_payload(sb, archive_id: str) -> Optional[dict]:
-    # ★ [핵심 수정] 상세 조회 시에도 헤더 필수
     anon_id = str(ensure_anon_session_id())
+    # 상세 조회 시 헤더 전송
     sb.postgrest.headers.update({'x-session-id': anon_id})
 
     try:
@@ -1899,8 +1899,8 @@ def db_fetch_payload(sb, archive_id: str) -> Optional[dict]:
     return None
 
 def db_fetch_followups(sb, archive_id: str) -> List[dict]:
-    # ★ [핵심 수정] 후속 질문 조회 시에도 헤더 필수
     anon_id = str(ensure_anon_session_id())
+    # 후속질문 조회 시 헤더 전송
     sb.postgrest.headers.update({'x-session-id': anon_id})
 
     try:
@@ -1916,24 +1916,34 @@ def db_fetch_followups(sb, archive_id: str) -> List[dict]:
         return []
 
 def db_insert_followup(sb, archive_id: str, turn: int, role: str, content: str):
-    anon_id = str(ensure_anon_session_id())  # ✅
+    anon_id = str(ensure_anon_session_id())
     
-    is_logged_in = st.session_state.get("logged_in", False)
+    # [수정] 후속 질문도 안전하게 서버 정보 확인 (일관성 유지)
     user = get_auth_user(sb)
-    user_id = user.get("id") if isinstance(user, dict) else None
-    user_email = st.session_state.get("user_email") if is_logged_in else None
+    real_user_id = None
+    real_user_email = None
 
+    if user:
+        if isinstance(user, dict):
+             real_user_id = user.get("id")
+             real_user_email = user.get("email")
+        else:
+             real_user_id = getattr(user, "id", None)
+             real_user_email = getattr(user, "email", None)
+    
+    # 여기서는 is_logged_in 변수 자체는 안 쓰이지만 로직 통일성을 위해 유지
+    
     row = {
         "archive_id": archive_id,
         "turn": turn,
         "role": role,
         "content": content,
-        "user_id": user_id if is_logged_in else None,
-        "user_email": (user_email.strip() if user_email else None),
+        "user_id": real_user_id,
+        "user_email": (real_user_email.strip() if real_user_email else None),
         "anon_session_id": anon_id,
     }
     try:
-        # ★ [핵심 수정] 후속 질문 저장 시에도 헤더 필수
+        # 후속질문 저장 시 헤더 전송
         sb.postgrest.headers.update({'x-session-id': anon_id})
         sb.table("work_followups").insert(row).execute()
     except Exception:
