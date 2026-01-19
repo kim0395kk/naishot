@@ -1807,22 +1807,27 @@ def run_workflow(user_input: str, log_placeholder, mode: str = "신속") -> dict
 
 
 # =========================================================
-# 5) DB OPS
+# 5) DB OPS (FIXED FOR RLS HEADERS)
 # =========================================================
 def db_insert_archive(sb, prompt: str, payload: dict) -> Optional[str]:
     archive_id = str(uuid.uuid4())            # ✅ 먼저 만든다
     anon_id = str(ensure_anon_session_id())   # ✅ text 컬럼이니 무조건 str
 
     user = get_auth_user(sb)
+    # 로그인 여부 체크를 확실하게
+    is_logged_in = st.session_state.get("logged_in", False)
     user_id = user.get("id") if isinstance(user, dict) else None
-    user_email = st.session_state.get("user_email") if st.session_state.get("logged_in") else None
+    
+    # [중요] 로그인 상태면 이메일을 확실히 가져옵니다.
+    user_email = st.session_state.get("user_email") if is_logged_in else None
 
     row = {
         "id": archive_id,  # ✅ 핵심
         "prompt": prompt,
         "payload": payload,
         "anon_session_id": anon_id,
-        "user_id": user_id if st.session_state.get("logged_in") else None,
+        "user_id": user_id if is_logged_in else None,
+        # 빈 문자열("")이 아니라 None으로 들어가야 비로그인 로직이 작동합니다.
         "user_email": (user_email.strip() if user_email else None),
         "client_meta": {"app_ver": APP_VERSION},
 
@@ -1834,14 +1839,22 @@ def db_insert_archive(sb, prompt: str, payload: dict) -> Optional[str]:
     }
 
     try:
+        # ★ [핵심 수정] 저장할 때 헤더에 세션 ID를 실어 보냅니다 (RLS 통과용)
+        # 이걸 안 보내면 DB가 "누구세요?" 하고 튕겨냅니다.
+        sb.postgrest.headers.update({'x-session-id': anon_id})
+        
         sb.table("work_archive").insert(row).execute()
-        return archive_id  # ✅ 응답 data 없어도 OK
+        return archive_id 
     except Exception as e:
         st.warning(f"ℹ️ DB 저장 실패: {e}")
         return None
 
 
 def db_fetch_history(sb, limit: int = 80) -> List[dict]:
+    # ★ [핵심 수정] 조회할 때도 "나 이 세션 주인이요" 하고 헤더 제출
+    anon_id = str(ensure_anon_session_id())
+    sb.postgrest.headers.update({'x-session-id': anon_id})
+
     try:
         q = (
             sb.table("work_archive")
@@ -1855,6 +1868,10 @@ def db_fetch_history(sb, limit: int = 80) -> List[dict]:
         return []
 
 def db_fetch_payload(sb, archive_id: str) -> Optional[dict]:
+    # ★ [핵심 수정] 상세 조회 시에도 헤더 필수
+    anon_id = str(ensure_anon_session_id())
+    sb.postgrest.headers.update({'x-session-id': anon_id})
+
     try:
         resp = (
             sb.table("work_archive")
@@ -1871,6 +1888,10 @@ def db_fetch_payload(sb, archive_id: str) -> Optional[dict]:
     return None
 
 def db_fetch_followups(sb, archive_id: str) -> List[dict]:
+    # ★ [핵심 수정] 후속 질문 조회 시에도 헤더 필수
+    anon_id = str(ensure_anon_session_id())
+    sb.postgrest.headers.update({'x-session-id': anon_id})
+
     try:
         resp = (
             sb.table("work_followups")
@@ -1885,20 +1906,24 @@ def db_fetch_followups(sb, archive_id: str) -> List[dict]:
 
 def db_insert_followup(sb, archive_id: str, turn: int, role: str, content: str):
     anon_id = str(ensure_anon_session_id())  # ✅
+    
+    is_logged_in = st.session_state.get("logged_in", False)
     user = get_auth_user(sb)
     user_id = user.get("id") if isinstance(user, dict) else None
-    user_email = st.session_state.get("user_email") if st.session_state.get("logged_in") else None
+    user_email = st.session_state.get("user_email") if is_logged_in else None
 
     row = {
         "archive_id": archive_id,
         "turn": turn,
         "role": role,
         "content": content,
-        "user_id": user_id if st.session_state.get("logged_in") else None,
-        "user_email": user_email if st.session_state.get("logged_in") else None,
+        "user_id": user_id if is_logged_in else None,
+        "user_email": (user_email.strip() if user_email else None),
         "anon_session_id": anon_id,
     }
     try:
+        # ★ [핵심 수정] 후속 질문 저장 시에도 헤더 필수
+        sb.postgrest.headers.update({'x-session-id': anon_id})
         sb.table("work_followups").insert(row).execute()
     except Exception:
         pass
