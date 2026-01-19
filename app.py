@@ -1810,17 +1810,28 @@ def run_workflow(user_input: str, log_placeholder, mode: str = "신속") -> dict
 # 5) DB OPS (FIXED FOR RLS HEADERS)
 # =========================================================
 def db_insert_archive(sb, prompt: str, payload: dict) -> Optional[str]:
-    archive_id = str(uuid.uuid4())            # ✅ 먼저 만든다
-    anon_id = str(ensure_anon_session_id())   # ✅ text 컬럼이니 무조건 str
+    archive_id = str(uuid.uuid4())
+    anon_id = str(ensure_anon_session_id())
 
+    # ---------------------------------------------------------
+    # [변경된 부분 시작] session_state 대신 실시간 user 정보 확인
+    # ---------------------------------------------------------
     user = get_auth_user(sb)
-    # 로그인 여부 체크를 확실하게
-    is_logged_in = st.session_state.get("logged_in", False)
-    user_id = user.get("id") if isinstance(user, dict) else None
     
-    # [중요] 로그인 상태면 이메일을 확실히 가져옵니다.
-    user_email = st.session_state.get("user_email") if is_logged_in else None
+    real_user_id = None
+    real_user_email = None
 
+    if user:
+        # user가 딕셔너리인지 객체인지 확인해서 안전하게 값 추출
+        if isinstance(user, dict):
+             real_user_id = user.get("id")
+             real_user_email = user.get("email")
+        else:
+             real_user_id = getattr(user, "id", None)
+             real_user_email = getattr(user, "email", None)
+
+    # 이메일이 실제로 존재해야 로그인 상태로 간주
+    is_logged_in = bool(real_user_email)
     row = {
         "id": archive_id,  # ✅ 핵심
         "prompt": prompt,
