@@ -896,8 +896,9 @@ def _refresh_admin_flag(sb, email: str):
 def touch_session(sb):
     if not sb: return
     try:
+        # [핵심] 이 줄이 있어야 401이 안 뜹니다!
         anon_id = str(ensure_anon_session_id())
-        sb.postgrest.headers.update({'x-session-id': anon_id})  # [핵심] 출입증 제출
+        sb.postgrest.headers.update({'x-session-id': anon_id}) 
         
         user = get_auth_user(sb)
         user_id = None
@@ -920,8 +921,9 @@ def touch_session(sb):
 def log_event(sb, event_type: str, archive_id: Optional[str] = None, meta: Optional[dict] = None):
     if not sb: return
     try:
+        # [핵심] 여기도 출입증 필수!
         anon_id = str(ensure_anon_session_id())
-        sb.postgrest.headers.update({'x-session-id': anon_id}) # [핵심] 출입증 제출
+        sb.postgrest.headers.update({'x-session-id': anon_id})
 
         user = get_auth_user(sb)
         final_email = st.session_state.get("user_email")
@@ -950,8 +952,9 @@ def log_event(sb, event_type: str, archive_id: Optional[str] = None, meta: Optio
 def log_api_call(sb, api_type: str, model_name: str=None, input_tokens: int=0, output_tokens: int=0, latency_ms: int=0, success: bool=True, error_message: str=None, request_summary: str=None, response_summary: str=None, archive_id: str=None):
     if not sb: return
     try:
+        # [핵심] 여기도 출입증 필수!
         anon_id = str(ensure_anon_session_id())
-        sb.postgrest.headers.update({'x-session-id': anon_id}) # [핵심] 출입증 제출
+        sb.postgrest.headers.update({'x-session-id': anon_id})
 
         user = get_auth_user(sb)
         final_email = st.session_state.get("user_email")
