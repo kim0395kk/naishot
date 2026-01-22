@@ -838,7 +838,7 @@ st.markdown(
 )
 
 # =========================================================
-# 3) SERVICES
+# 3) SERVICES (FIXED VERSION)
 # =========================================================
 def get_secret(path1: str, path2: str = "") -> Optional[str]:
     try:
@@ -884,7 +884,6 @@ def get_auth_user(sb):
         return None
 
 def _refresh_admin_flag(sb, email: str):
-    """로그인 직후 app_admins 테이블로 관리자 여부 동기화"""
     st.session_state.is_admin_db = False
     if not sb or not email:
         return
@@ -895,54 +894,46 @@ def _refresh_admin_flag(sb, email: str):
         st.session_state.is_admin_db = False
 
 def touch_session(sb):
-    if not sb:
-        return
-    anon_id = ensure_anon_session_id()
-    user_email = st.session_state.get("user_email") if st.session_state.get("logged_in") else None
-    user_id = None
-    user = get_auth_user(sb)
-    if user and isinstance(user, dict):
-        user_id = user.get("id")
-
-    payload = {
-        "session_id": anon_id,
-        "last_seen": datetime.utcnow().isoformat() + "Z",
-        "user_id": user_id,
-        "user_email": user_email,
-        "meta": {"app_ver": APP_VERSION},
-    }
+    if not sb: return
     try:
+        anon_id = str(ensure_anon_session_id())
+        sb.postgrest.headers.update({'x-session-id': anon_id})  # [핵심] 출입증 제출
+        
+        user = get_auth_user(sb)
+        user_id = None
+        user_email = st.session_state.get("user_email")
+        if user and isinstance(user, dict):
+             user_id = user.get("id")
+             if user.get("email"): user_email = user.get("email")
+
+        payload = {
+            "session_id": anon_id,
+            "last_seen": datetime.utcnow().isoformat() + "Z",
+            "user_id": user_id,
+            "user_email": user_email,
+            "meta": {"app_ver": APP_VERSION},
+        }
         sb.table("app_sessions").upsert(payload, on_conflict="session_id").execute()
     except Exception:
         pass
 
 def log_event(sb, event_type: str, archive_id: Optional[str] = None, meta: Optional[dict] = None):
-    if not sb:
-        return
-    
+    if not sb: return
     try:
-        # 1. 익명 ID 가져오기
         anon_id = str(ensure_anon_session_id())
+        sb.postgrest.headers.update({'x-session-id': anon_id}) # [핵심] 출입증 제출
 
-        # 2. [핵심 수정] 출입증(헤더) 제출 (이게 없어서 에러가 났던 것)
-        sb.postgrest.headers.update({'x-session-id': anon_id})
-
-        # 3. 로그인 정보 확인 (하이브리드 체크)
         user = get_auth_user(sb)
-        server_email = None
-        server_user_id = None
-
+        final_email = st.session_state.get("user_email")
+        final_user_id = None
+        
         if user:
             if isinstance(user, dict):
-                server_user_id = user.get("id")
-                server_email = user.get("email")
+                final_user_id = user.get("id")
+                if user.get("email"): final_email = user.get("email")
             else:
-                server_user_id = getattr(user, "id", None)
-                server_email = getattr(user, "email", None)
-        
-        # 서버 조회 실패 시 세션 정보 사용
-        final_email = server_email if server_email else st.session_state.get("user_email")
-        final_user_id = server_user_id 
+                final_user_id = getattr(user, "id", None)
+                if getattr(user, "email", None): final_email = getattr(user, "email", None)
 
         row = {
             "event_type": event_type,
@@ -952,53 +943,27 @@ def log_event(sb, event_type: str, archive_id: Optional[str] = None, meta: Optio
             "anon_session_id": anon_id,
             "meta": meta or {},
         }
-        
         sb.table("app_events").insert(row).execute()
-        
     except Exception:
         pass
 
-
-def log_api_call(
-    sb,
-    api_type: str,
-    model_name: Optional[str] = None,
-    input_tokens: int = 0,
-    output_tokens: int = 0,
-    latency_ms: int = 0,
-    success: bool = True,
-    error_message: Optional[str] = None,
-    request_summary: Optional[str] = None,
-    response_summary: Optional[str] = None,
-    archive_id: Optional[str] = None,
-):
-    """
-    개별 API 호출 기록 (법령API, 네이버검색, LLM 등)
-    """
-    if not sb:
-        return
-
+def log_api_call(sb, api_type: str, model_name: str=None, input_tokens: int=0, output_tokens: int=0, latency_ms: int=0, success: bool=True, error_message: str=None, request_summary: str=None, response_summary: str=None, archive_id: str=None):
+    if not sb: return
     try:
-        # 1. 익명 ID 가져오기
         anon_id = str(ensure_anon_session_id())
+        sb.postgrest.headers.update({'x-session-id': anon_id}) # [핵심] 출입증 제출
 
-        # 2. [핵심 수정] 여기도 출입증(헤더) 제출 필수!
-        sb.postgrest.headers.update({'x-session-id': anon_id})
-
-        # 3. 로그인 정보 확인
         user = get_auth_user(sb)
-        server_email = None
+        final_email = st.session_state.get("user_email")
         if user:
-            if isinstance(user, dict):
-                server_email = user.get("email")
-            else:
-                server_email = getattr(user, "email", None)
-        
-        final_email = server_email if server_email else st.session_state.get("user_email")
+             if isinstance(user, dict):
+                 if user.get("email"): final_email = user.get("email")
+             else:
+                 if getattr(user, "email", None): final_email = getattr(user, "email", None)
         
         if not archive_id:
             archive_id = st.session_state.get("current_archive_id")
-        
+
         row = {
             "archive_id": archive_id,
             "user_email": final_email,
@@ -1010,13 +975,11 @@ def log_api_call(
             "total_tokens": input_tokens + output_tokens,
             "latency_ms": latency_ms,
             "success": success,
-            "error_message": error_message[:500] if error_message else None,
-            "request_summary": request_summary[:200] if request_summary else None,
-            "response_summary": response_summary[:200] if response_summary else None,
+            "error_message": str(error_message)[:500] if error_message else None,
+            "request_summary": str(request_summary)[:200] if request_summary else None,
+            "response_summary": str(response_summary)[:200] if response_summary else None,
         }
-
         sb.table("api_call_logs").insert(row).execute()
-
     except Exception:
         pass
 
