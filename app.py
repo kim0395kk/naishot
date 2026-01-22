@@ -925,23 +925,42 @@ def touch_session(sb):
 def log_event(sb, event_type: str, archive_id: Optional[str] = None, meta: Optional[dict] = None):
     if not sb:
         return
-    anon_id = ensure_anon_session_id()
-    user_email = st.session_state.get("user_email") if st.session_state.get("logged_in") else None
-    user_id = None
-    user = get_auth_user(sb)
-    if user and isinstance(user, dict):
-        user_id = user.get("id")
-
-    row = {
-        "event_type": event_type,
-        "archive_id": archive_id,
-        "user_id": user_id,
-        "user_email": user_email,
-        "anon_session_id": anon_id,
-        "meta": meta or {},
-    }
+    
     try:
+        # 1. 익명 ID 가져오기
+        anon_id = str(ensure_anon_session_id())
+
+        # 2. [핵심 수정] 출입증(헤더) 제출 (이게 없어서 에러가 났던 것)
+        sb.postgrest.headers.update({'x-session-id': anon_id})
+
+        # 3. 로그인 정보 확인 (하이브리드 체크)
+        user = get_auth_user(sb)
+        server_email = None
+        server_user_id = None
+
+        if user:
+            if isinstance(user, dict):
+                server_user_id = user.get("id")
+                server_email = user.get("email")
+            else:
+                server_user_id = getattr(user, "id", None)
+                server_email = getattr(user, "email", None)
+        
+        # 서버 조회 실패 시 세션 정보 사용
+        final_email = server_email if server_email else st.session_state.get("user_email")
+        final_user_id = server_user_id 
+
+        row = {
+            "event_type": event_type,
+            "archive_id": archive_id,
+            "user_id": final_user_id,
+            "user_email": final_email,
+            "anon_session_id": anon_id,
+            "meta": meta or {},
+        }
+        
         sb.table("app_events").insert(row).execute()
+        
     except Exception:
         pass
 
@@ -961,35 +980,51 @@ def log_api_call(
 ):
     """
     개별 API 호출 기록 (법령API, 네이버검색, LLM 등)
-    api_type: 'law_api', 'naver_search', 'llm_vertex', 'llm_gemini', 'llm_groq'
     """
     if not sb:
         return
-    user_email = st.session_state.get("user_email") if st.session_state.get("logged_in") else None
-    
-    # archive_id가 없으면 현재 세션의 archive_id 사용 시도
-    if not archive_id:
-        archive_id = st.session_state.get("current_archive_id")
-    
-    row = {
-        "archive_id": archive_id,
-        "user_email": user_email,
-        "api_type": api_type,
-        "model_name": model_name,
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "total_tokens": input_tokens + output_tokens,
-        "latency_ms": latency_ms,
-        "success": success,
-        "error_message": error_message[:500] if error_message else None,
-        "request_summary": request_summary[:200] if request_summary else None,
-        "response_summary": response_summary[:200] if response_summary else None,
-    }
-    try:
-        sb.table("api_call_logs").insert(row).execute()
-    except Exception:
-        pass  # 로깅 실패해도 앱 동작에 영향 주지 않음
 
+    try:
+        # 1. 익명 ID 가져오기
+        anon_id = str(ensure_anon_session_id())
+
+        # 2. [핵심 수정] 여기도 출입증(헤더) 제출 필수!
+        sb.postgrest.headers.update({'x-session-id': anon_id})
+
+        # 3. 로그인 정보 확인
+        user = get_auth_user(sb)
+        server_email = None
+        if user:
+            if isinstance(user, dict):
+                server_email = user.get("email")
+            else:
+                server_email = getattr(user, "email", None)
+        
+        final_email = server_email if server_email else st.session_state.get("user_email")
+        
+        if not archive_id:
+            archive_id = st.session_state.get("current_archive_id")
+        
+        row = {
+            "archive_id": archive_id,
+            "user_email": final_email,
+            "anon_session_id": anon_id,
+            "api_type": api_type,
+            "model_name": model_name,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "latency_ms": latency_ms,
+            "success": success,
+            "error_message": error_message[:500] if error_message else None,
+            "request_summary": request_summary[:200] if request_summary else None,
+            "response_summary": response_summary[:200] if response_summary else None,
+        }
+
+        sb.table("api_call_logs").insert(row).execute()
+
+    except Exception:
+        pass
 
 class LLMService:
     """Vertex AI 기반 LLM 서비스 (Gemini API 및 Groq 폴백 지원)"""
