@@ -2377,21 +2377,50 @@ def render_master_dashboard(sb):
     st.divider()
 
     # 로그 테이블 & 관리
-    st.subheader("📋 상세 감사 로그")
+st.subheader("📋 상세 감사 로그")
+    
     if not filtered_df.empty:
+        # 최근 100개만 조회
         disp = filtered_df.sort_values("created_at", ascending=False).head(100)
-        disp["created_at"] = disp["created_at"].dt.strftime("%Y-%m-%d %H:%M")
         
+        # [수정 1] 작성일시를 '한국 시간'으로 변환하고 초 단위까지 표시
+        disp["created_at"] = disp["created_at"].dt.tz_convert("Asia/Seoul").dt.strftime("%Y-%m-%d %H:%M:%S")
+        
+        # [수정 2] 소요 시간(초) 포맷팅 (예: 1.2s)
+        disp["execution_time"] = disp["execution_time"].apply(lambda x: f"{x:.1f}s")
+        
+        # [수정 3] 비용 포맷팅
+        disp["cost_usd"] = disp["cost_usd"].apply(lambda x: f"${x:.6f}")
+        
+        # 스타일링 함수 (헤비유저/지연 건 강조)
         def style_rows(row):
-            s = [""]*len(row)
-            if row["user_email"] in heavy_users: s = ["background-color:#fef3c7"]*len(row)
+            s = [""] * len(row)
+            user = row["user_email"]
+            # 문자열 "1.2s"에서 "s" 떼고 숫자로 변환해 비교
+            try: exec_time = float(row["execution_time"].replace("s", ""))
+            except: exec_time = 0
+            
+            if user in heavy_users: 
+                s = ["background-color: #fef3c7"] * len(row) # 노란색
+            if exec_time > LONG_LATENCY_THRESHOLD: 
+                s = ["background-color: #fee2e2; color: #991b1b; font-weight: bold"] * len(row) # 빨간색
             return s
             
-        st.dataframe(disp[["created_at", "user_email", "prompt", "model_used", "cost_usd"]].style.apply(style_rows, axis=1), use_container_width=True)
+        # ★ [핵심] 컬럼 목록에 'execution_time'을 다시 넣었습니다!
+        st.dataframe(
+            disp[["created_at", "user_email", "prompt", "model_used", "cost_usd", "execution_time"]]
+            .style.apply(style_rows, axis=1),
+            use_container_width=True
+        )
         
-        with st.expander("🔍 내용 자세히 보기"):
-            sid = st.selectbox("로그 ID", disp["id"].tolist())
-            if sid: st.text_area("Prompt", filtered_df[filtered_df["id"]==sid]["prompt"].values[0])
+        # 상세 내용 보기 (프롬프트 전체)
+        with st.expander("🔍 프롬프트 원문 보기"):
+            sel_id = st.selectbox("로그 선택", disp["id"].tolist())
+            if sel_id:
+                txt = filtered_df[filtered_df["id"] == sel_id]["prompt"].values[0]
+                st.text_area("전체 내용", txt, height=150)
+    else:
+        st.info("검색 조건에 맞는 로그가 없습니다.")
 
     # 삭제/다운로드
     col1, col2 = st.columns(2)
