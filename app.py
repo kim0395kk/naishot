@@ -2377,7 +2377,7 @@ def render_master_dashboard(sb):
     st.divider()
 
     # 로그 테이블 & 관리
-st.subheader("📋 상세 감사 로그")
+    st.subheader("📋 상세 감사 로그")
     
     if not filtered_df.empty:
         # 최근 100개만 조회
