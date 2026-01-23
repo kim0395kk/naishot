@@ -65,6 +65,17 @@ MODEL_PRICING = {
     "(unknown)": 0.10,
 }
 
+from govable_ai.features.duty_manual import render_duty_manual_button
+from govable_ai.core.llm_service import LLMService
+from govable_ai.config import get_secret, get_vertex_config
+
+# Initialize LLM Service Globally
+llm_service = LLMService(
+    vertex_config=get_vertex_config(),
+    gemini_key=get_secret("general", "GEMINI_API_KEY"),
+    groq_key=get_secret("general", "GROQ_API_KEY"),
+)
+
 # Heavy user / Long latency 임계값
 HEAVY_USER_PERCENTILE = 95  # 상위 5% = 과다 사용자
 LONG_LATENCY_THRESHOLD = 120  # 초
@@ -684,23 +695,6 @@ st.markdown(
         color: var(--neutral-900) !important;
         font-weight: 700 !important;
     }
-    
-    h1 { font-size: 2.5rem !important; }
-    h2 { font-size: 1.75rem !important; margin-top: var(--space-xl) !important; }
-    h3 { font-size: 1.25rem !important; margin-top: var(--space-lg) !important; }
-
-    /* ====================== */
-    /* Hide Default Elements */
-    /* ====================== */
-    header [data-testid="stToolbar"] { display: none !important; }
-    header [data-testid="stDecoration"] { display: none !important; }
-    header { height: 0px !important; }
-    footer { display: none !important; }
-    div[data-testid="stStatusWidget"] { display: none !important; }
-
-    /* ====================== */
-    /* Premium Agent Logs */
-    /* ====================== */
     .agent-log { 
         font-family: 'Inter', 'Consolas', monospace; 
         font-size: 0.9rem; 
@@ -1142,6 +1136,21 @@ class LLMService:
             return json.loads(text)
         except:
             return None
+    
+    def embed_text(self, text: str) -> list:
+        """Gemini API를 사용한 텍스트 임베딩"""
+        if not self.gemini_api_ready:
+            return []
+        try:
+            # text-embedding-004 사용
+            result = genai.embed_content(
+                model="models/text-embedding-004",
+                content=text,
+                task_type="retrieval_query"
+            )
+            return result['embedding']
+        except Exception:
+            return []
 
 # 인스턴스 생성
 llm_service = LLMService()
@@ -2086,7 +2095,7 @@ def render_history_list(sb):
 
     # 비로그인은 select 불가(RLS)
     if not st.session_state.get("logged_in") and not admin_all:
-        st.sidebar.caption("로그인: 저장기능활성화")
+
         return
 
     # 새 채팅 버튼 (로그인 유저용)
@@ -2195,7 +2204,7 @@ def admin_get_today_visitors(sb) -> int:
         return res.count if res.count is not None else 0
     except: return 0
 
-def render_master_dashboard(sb):
+def render_master_dashboard(sb, llm_service=None):
     st.markdown("## 🏛️ 관리자 운영 마스터 콘솔")
 
     if not is_admin_user(st.session_state.get("user_email", "")):
@@ -2205,6 +2214,47 @@ def render_master_dashboard(sb):
     if not st.session_state.get("admin_mode", False):
         st.info("사이드바에서 **관리자모드 켜기**를 활성화하세요.")
         return
+
+    # [NEW] 데이터 관리 (임베딩 생성)
+    with st.expander("🛠️ 데이터베이스 관리 (임베딩 생성)", expanded=False):
+        st.info("당직 매뉴얼 데이터에 벡터 임베딩이 없는 경우 검색이 되지 않습니다. 아래 버튼을 눌러 임베딩을 생성하세요.")
+        
+        col_db1, col_db2 = st.columns(2)
+        with col_db1:
+            if st.button("🔄 매뉴얼 임베딩 생성(재처리)", use_container_width=True):
+                if not llm_service:
+                    st.error("LLM 서비스가 연결되지 않았습니다.")
+                else:
+                    try:
+                        # 1. 임베딩 없는 데이터 조회
+                        res = sb.table("duty_manual_kb").select("*").is_("embedding", "null").execute()
+                        rows = res.data
+                        
+                        if not rows:
+                            st.success("모든 데이터에 임베딩이 이미 존재합니다.")
+                        else:
+                            progress_bar = st.progress(0)
+                            status_text = st.empty()
+                            success_count = 0
+                            
+                            for idx, row in enumerate(rows):
+                                content = row.get("content", "")
+                                if content:
+                                    emb = llm_service.embed_text(content)
+                                    if emb:
+                                        # 업데이트
+                                        sb.table("duty_manual_kb").update({"embedding": emb}).eq("id", row["id"]).execute()
+                                        success_count += 1
+                                
+                                progress = (idx + 1) / len(rows)
+                                progress_bar.progress(progress)
+                                status_text.text(f"처리 중... ({idx+1}/{len(rows)})")
+                            
+                            st.success(f"완료! {success_count}건의 임베딩을 생성했습니다.")
+                            st.rerun()
+                            
+                    except Exception as e:
+                        st.error(f"작업 중 오류 발생: {e}")
 
     # 1. 데이터 로드
     with st.spinner("📊 데이터 분석 중..."):
@@ -2542,11 +2592,6 @@ def _followup_agent_answer(res: dict, user_q: str) -> Tuple[str, Optional[dict]]
 """
     ans = llm_service.generate_text(ctx + "\n\n" + prompt2)
     return (ans or "").strip() or "답변 생성 실패", None
-
-
-# =========================================================
-# 10) MAIN UI
-# =========================================================
 def main():
     sb = get_supabase()
     ensure_anon_session_id()
@@ -2558,6 +2603,10 @@ def main():
             log_event(sb, "app_open", meta={"ver": APP_VERSION})
 
         sidebar_auth(sb)
+
+        # [NEW] 당직메뉴얼 버튼 추가
+        st.sidebar.markdown("---")
+        render_duty_manual_button(sb, llm_service)
         render_history_list(sb)
     else:
         st.sidebar.error("Supabase 연결 정보(secrets)가 없습니다.")
@@ -2573,7 +2622,7 @@ def main():
     if is_admin_tab:
         tabs = st.tabs(["🧠 업무 처리", "🏛️ 마스터 대시보드"])
         with tabs[1]:
-            render_master_dashboard(sb)
+            render_master_dashboard(sb, llm_service)
         with tabs[0]:
             pass
 
