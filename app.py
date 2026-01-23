@@ -695,6 +695,15 @@ st.markdown(
         color: var(--neutral-900) !important;
         font-weight: 700 !important;
     }
+        /* ====================== */
+    /* Hide Default Elements */
+    /* ====================== */
+    header [data-testid="stToolbar"] { display: none !important; }
+    header [data-testid="stDecoration"] { display: none !important; }
+    header { height: 0px !important; }
+    footer { display: none !important; }
+    div[data-testid="stStatusWidget"] { display: none !important; }
+    
     .agent-log { 
         font-family: 'Inter', 'Consolas', monospace; 
         font-size: 0.9rem; 
