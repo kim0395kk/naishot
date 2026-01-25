@@ -2998,29 +2998,38 @@ def main():
                 label_visibility="collapsed",
             )
             
-            st.markdown("### ✏️ 수정 요청사항")
+            st.markdown("### ✏️ 수정 요청사항 (선택)")
             revision_request = st.text_area(
-                "수정 요청사항 (어떤 부분을 어떻게 수정할지 작성하세요)",
+                "수정 요청사항 (비워두면 '공문서 작성 표준'에 맞게 자동 교정합니다)",
                 height=150,
-                placeholder="수정을 원하는 내용을 구체적으로 작성해주세요.\n\n예시:\n- 일시를 2025. 1. 28.로 변경해주세요\n- 제목을 좀 더 부드럽게 바꿔주세요\n- '엄격히' 같은 위압적인 표현을 순화해주세요\n- 날짜 표기를 2025년 1월 표준 형식으로 통일해주세요",
+                placeholder="비워두시면 '2025 개정 공문서 작성 표준'에 맞춰 오탈자, 띄어쓰기, 표현을 자동으로 교정합니다.\n\n특정 요청이 있다면 적어주세요:\n- 일시를 2025. 1. 28.로 변경해주세요\n- 제목을 좀 더 부드럽게 바꿔주세요",
                 key="revision_request",
                 label_visibility="collapsed",
             )
             
             if st.button("✨ 수정안 생성", type="primary", use_container_width=True):
-                if not original_text and not revision_request:
-                    st.warning("⚠️ 원문과 수정 요청사항을 모두 입력해주세요.")
-                elif not original_text:
+                if not original_text:
                     st.warning("⚠️ 원문을 입력해주세요.")
-                elif not revision_request:
-                    st.warning("⚠️ 수정 요청사항을 입력해주세요.")
                 else:
                     # 두 입력을 합쳐서 전달
                     combined_input = f"[원문]\n{original_text}\n\n[수정 요청]\n{revision_request}"
-                    with st.spinner("문서 수정 분석 중..."):
-                        res = run_revision_workflow(combined_input, llm_service)
-                        st.session_state.workflow_result = res
-                        st.rerun()
+                    
+                    # 진행 상황 표시 (Progressive Feedback)
+                    with st.status("📝 문서 수정 분석 중...", expanded=True) as status:
+                        st.write("1. 원문 분석 및 표준 규격 대조 중...")
+                        time.sleep(0.5) # UX용 짧은 대기
+                        st.write("2. 오탈자 및 표현 교정 진행 중...")
+                        
+                        user_email = st.session_state.get("user_email")
+                        res = run_revision_workflow(combined_input, llm_service, sb, user_email)
+                        
+                        if "error" in res:
+                            status.update(label="❌ 처리 실패", state="error")
+                            st.error(res["error"])
+                        else:
+                            status.update(label="✅ 수정 완료!", state="complete", expanded=False)
+                            st.session_state.workflow_result = res
+                            st.rerun()
 
             # 결과가 있으면 왼쪽에 변경 로그 표시
             if "workflow_result" in st.session_state:
