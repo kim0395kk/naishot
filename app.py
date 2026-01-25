@@ -66,6 +66,7 @@ MODEL_PRICING = {
 }
 
 from govable_ai.features.duty_manual import render_duty_manual_button
+from govable_ai.features.document_revision import render_revision_sidebar_button, run_revision_workflow
 from govable_ai.core.llm_service import LLMService
 from govable_ai.config import get_secret, get_vertex_config
 
@@ -695,15 +696,6 @@ st.markdown(
         color: var(--neutral-900) !important;
         font-weight: 700 !important;
     }
-        /* ====================== */
-    /* Hide Default Elements */
-    /* ====================== */
-    header [data-testid="stToolbar"] { display: none !important; }
-    header [data-testid="stDecoration"] { display: none !important; }
-    header { height: 0px !important; }
-    footer { display: none !important; }
-    div[data-testid="stStatusWidget"] { display: none !important; }
-    
     .agent-log { 
         font-family: 'Inter', 'Consolas', monospace; 
         font-size: 0.9rem; 
@@ -1024,6 +1016,98 @@ def log_api_call(
         pass
 
 
+def log_document_revision(
+    sb,
+    original_text: str,
+    revised_doc: dict,
+    changelog: list,
+    summary: str,
+    model_used: str,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    execution_time: float = 0.0
+):
+    """
+    기안/공고문 수정 내역 기록
+    """
+    if not sb:
+        return
+    
+    try:
+        anon_id = str(ensure_anon_session_id())
+        sb.postgrest.headers.update({'x-session-id': anon_id})
+        
+        user = get_auth_user(sb)
+        server_email = None
+        if user:
+            if isinstance(user, dict):
+                server_email = user.get("email")
+            else:
+                server_email = getattr(user, "email", None)
+        
+        final_email = server_email if server_email else st.session_state.get("user_email")
+        
+        row = {
+            "user_email": final_email,
+            "anon_session_id": anon_id,
+            "original_text": original_text[:1000],  # 첫 1000자만
+            "revised_doc": revised_doc,
+            "changelog": changelog,
+            "summary": summary,
+            "model_used": model_used,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "execution_time": execution_time,
+        }
+        
+        sb.table("document_revisions").insert(row).execute()
+    except Exception:
+        pass
+
+
+def log_lawbot_query(
+    sb,
+    query: str,
+    results_count: int = 0,
+    selected_laws: list = None,
+    search_type: str = "law",
+    execution_time: float = 0.0
+):
+    """
+    당직봇 검색 내역 기록
+    """
+    if not sb:
+        return
+    
+    try:
+        anon_id = str(ensure_anon_session_id())
+        sb.postgrest.headers.update({'x-session-id': anon_id})
+        
+        user = get_auth_user(sb)
+        server_email = None
+        if user:
+            if isinstance(user, dict):
+                server_email = user.get("email")
+            else:
+                server_email = getattr(user, "email", None)
+        
+        final_email = server_email if server_email else st.session_state.get("user_email")
+        
+        row = {
+            "user_email": final_email,
+            "anon_session_id": anon_id,
+            "query": query[:500],  # 첫 500자만
+            "results_count": results_count,
+            "selected_laws": selected_laws or [],
+            "search_type": search_type,
+            "execution_time": execution_time,
+        }
+        
+        sb.table("lawbot_queries").insert(row).execute()
+    except Exception:
+        pass
+
+
 class LLMService:
     """✅ Vertex AI 제거됨: Gemini API (Google AI Studio) 및 Groq 폴백 전용"""
     
@@ -1063,14 +1147,24 @@ class LLMService:
         """서비스 가용 여부 확인"""
         return self.gemini_api_ready or (self.groq_client is not None)
 
-    def _try_gemini_api_text(self, prompt: str) -> Tuple[str, str]:
-        """Gemini API로 텍스트 생성"""
+    def _try_gemini_api_text(self, prompt: str, preferred_model: Optional[str] = None) -> Tuple[str, str]:
+        """Gemini API로 텍스트 생성
+        
+        Args:
+            prompt: 생성할 텍스트 프롬프트
+            preferred_model: 우선적으로 사용할 모델 이름 (예: 'gemini-2.5-flash')
+        """
         if not self.gemini_api_ready:
             raise Exception("Gemini API not ready")
             
         last_error = None
         
-        for m_name in self.gemini_models:
+        # 우선 모델이 지정된 경우 먼저 시도
+        models_to_try = [preferred_model] + self.gemini_models if preferred_model else self.gemini_models
+        
+        for m_name in models_to_try:
+            if not m_name:  # None 스킵
+                continue
             try:
                 model = genai.GenerativeModel(m_name)
                 response = model.generate_content(prompt)
@@ -1093,8 +1187,13 @@ class LLMService:
         except Exception:
             return "System Error"
 
-    def generate_text(self, prompt: str) -> str:
-        """메인 함수: Gemini API -> Groq 순서로 시도"""
+    def generate_text(self, prompt: str, preferred_model: Optional[str] = None) -> str:
+        """메인 함수: Gemini API -> Groq 순서로 시도
+        
+        Args:
+            prompt: 생성할 텍스트 프롬프트
+            preferred_model: 우선적으로 사용할 모델 이름 (예: 'gemini-2.5-flash')
+        """
         sb = get_supabase()
         start_time = time.time()
         
@@ -1105,7 +1204,7 @@ class LLMService:
         
         # 1. Gemini API 시도
         try:
-            text, used_model = self._try_gemini_api_text(prompt)
+            text, used_model = self._try_gemini_api_text(prompt, preferred_model)
             if text:
                 latency = int((time.time() - start_time) * 1000)
                 try:
@@ -1135,10 +1234,15 @@ class LLMService:
         st.session_state["last_model_used"] = None
         return "시스템 오류: AI 응답 불가"
 
-    def generate_json(self, prompt: str) -> Optional[Any]:
-        """JSON 생성 유틸"""
+    def generate_json(self, prompt: str, preferred_model: Optional[str] = None) -> Optional[Any]:
+        """JSON 생성 유틸
+        
+        Args:
+            prompt: 생성할 JSON 프롬프트
+            preferred_model: 우선적으로 사용할 모델 이름 (예: 'gemini-2.5-flash')
+        """
         strict = prompt + "\n\n반드시 순수한 JSON 형식만 출력하세요. 마크다운(```json)이나 불필요한 설명 제외."
-        text = self.generate_text(strict)
+        text = self.generate_text(strict, preferred_model)
         text = re.sub(r"```json", "", text)
         text = re.sub(r"```", "", text).strip()
         try:
@@ -1569,11 +1673,12 @@ Task: 아래 상황에 적용될 법령과 조항을 찾아 설명하시오.
 """.strip()
 
         prompt = f"""
-당신은 행정기관의 베테랑 서기이다. 아래 정보를 바탕으로 완결된 공문서를 JSON으로 작성하라.
+당신은 대한민국 행정기관의 공문서 작성 및 교정 전문가인 'AI 행정관 Pro'이다.
+아래 정보를 바탕으로 '2025년 개정 공문서 작성 표준'에 맞춰 완결된 공문서를 JSON으로 작성하라.
 
 [입력]
 - 민원: {situation}
-- 시행일자: {meta.get('today_str')}
+- 시행일자: {meta.get('today_str')} (반드시 'YYYY. M. D.' 형식 준수)
 - 문서번호: {meta.get('doc_num')}
 
 [법령 근거(필수 인용)]
@@ -1588,11 +1693,31 @@ Task: 아래 상황에 적용될 법령과 조항을 찾아 설명하시오.
 [예상 반발(반영)]
 {json.dumps(objections, ensure_ascii=False)}
 
-[원칙]
-- 본문에 법 조항/근거를 문장으로 인용할 것
-- 구조: 경위 -> 법적 근거 -> 조치/안내 -> 이의제기/문의
-- 개인정보는 OOO로 마스킹
-- 문단 내에 **1** 같은 번호는 **볼드**로 표시해도 됨(마크다운 허용)
+[작성 원칙 (2025 개정 표준)]
+1. **핵심 원칙**:
+   - 사실성: 육하원칙 준수, 오자/탈자/계수 착오 금지.
+   - 용이성: 쉬운 용어 사용, 짧고 명확한 문장.
+   - 명확성: 불분명한 단어 회피, 정확한 조사 사용.
+   - 비고압성: '금지', '엄금' 대신 '안내', '부탁' 등 긍정적 표현 사용.
+   - 수요자 중심: 주어를 '국민(수요자)' 관점으로 (예: '교부합니다' -> '수령하실 수 있습니다').
+
+2. **형식 및 표기 규칙 (엄격 준수)**:
+   - **항목 기호 순서**: 1. -> 가. -> 1) -> 가) -> (1) -> (가) -> ① -> ㉮
+   - **띄어쓰기**:
+     - 첫째 항목 기호는 제목 첫 글자와 같은 위치.
+     - 하위 항목은 상위 항목보다 2타(한글 1자) 오른쪽 시작.
+     - 항목 기호와 내용 사이 1타 띄움.
+   - **날짜/시간**:
+     - 날짜: '2025. 1. 8.' (마지막 '일' 뒤에도 마침표).
+     - 시간: '09:00', '13:20' (쌍점 앞뒤 붙임).
+   - **금액**: '금13,500원(금일만삼천오백원)' (붙여쓰기).
+   - **끝 표시**: 본문/붙임 끝에 2타 띄우고 '끝.'
+
+3. **교정 가이드**:
+   - 불명확한 주어 구체화 (예: '우리 기관' -> 공식 명칭).
+   - 외래어 순화 (예: '스크린도어' -> '안전문').
+   - 중복 표현 제거 ('2월달' -> '2월', '기간 동안' -> '기간에').
+   - 문장 종결: 평서형 '-다' 원칙 (내부 결재는 '-함', '-것' 허용).
 
 [출력 JSON 스키마]
 {schema}
@@ -2316,6 +2441,94 @@ def render_master_dashboard(sb, llm_service=None):
         df["cost_usd"] = 0.0
         heavy_users = set()
 
+    # 2. 기능별 사용 통계
+    st.subheader("🎯 기능별 사용 현황")
+    try:
+        res_features = sb.table("analytics_feature_usage").select("*").execute()
+        if res_features.data:
+            df_features = pd.DataFrame(res_features.data)
+            
+            col_f1, col_f2= st.columns(2)
+            with col_f1:
+                st.markdown("**사용량**")
+                st.dataframe(
+                    df_features[["feature_name", "usage_count", "unique_users"]],
+                    use_container_width=True,
+                    hide_index=True
+                )
+            
+            with col_f2:
+                st.markdown("**평균 실행 시간 & 토큰**")
+                st.dataframe(
+                    df_features[["feature_name", "avg_execution_time", "total_tokens"]],
+                    use_container_width=True,
+                    hide_index=True
+                )
+    except Exception as e:
+        st.error(f"기능별 통계 로드 실패: {e}")
+    
+    st.markdown("---")
+    
+    # 2.5. 모델별 비용 분석
+    st.subheader("💰 모델별 비용 분석")
+    try:
+        res_costs = sb.table("analytics_model_costs").select("*").execute()
+        if res_costs.data:
+            df_costs = pd.DataFrame(res_costs.data)
+            
+            # 비용이 높은 순서로 정렬
+            df_costs = df_costs.sort_values("cost_usd", ascending=False)
+            
+            col_c1, col_c2, col_c3 = st.columns(3)
+            total_cost = df_costs["cost_usd"].sum()
+            total_calls = df_costs["call_count"].sum()
+            total_tokens = df_costs["total_tokens"].sum()
+            
+            col_c1.metric("💵 총 비용 (USD)", f"${total_cost:.4f}")
+            col_c2.metric("📞 총 호출 수", f"{int(total_calls):,}")
+            col_c3.metric("🎫 총 토큰", f"{int(total_tokens):,}")
+            
+            st.markdown("**모델별 세부 정보**")
+            st.dataframe(
+                df_costs[[
+                    "model_name", 
+                    "call_count", 
+                    "total_input_tokens", 
+                    "total_output_tokens",
+                    "cost_usd",
+                    "avg_latency_ms",
+                    "unique_users"
+                ]],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "cost_usd": st.column_config.NumberColumn("비용 (USD)", format="$%.6f"),
+                    "call_count": st.column_config.NumberColumn("호출 수", format="%d"),
+                    "total_input_tokens": st.column_config.NumberColumn("입력 토큰", format="%d"),
+                    "total_output_tokens": st.column_config.NumberColumn("출력 토큰", format="%d"),
+                    "avg_latency_ms": st.column_config.NumberColumn("평균 지연(ms)", format="%d"),
+                    "unique_users": st.column_config.NumberColumn("사용자 수", format="%d"),
+                }
+            )
+            
+            # 일별 비용 추이
+            try:
+                res_daily_cost = sb.table("analytics_total_cost_summary").select("*").limit(30).execute()
+                if res_daily_cost.data:
+                    df_daily_cost = pd.DataFrame(res_daily_cost.data)
+                    df_daily_cost["date"] = pd.to_datetime(df_daily_cost["date"])
+                    df_daily_cost = df_daily_cost.sort_values("date")
+                    
+                    st.markdown("**일별 비용 추이 (최근 30일)**")
+                    st.line_chart(df_daily_cost.set_index("date")["daily_cost_usd"])
+            except:
+                pass
+                
+    except Exception as e:
+        st.error(f"모델 비용 통계 로드 실패: {e}")
+    
+    st.markdown("---")
+    
     # 3. 사용자 활동 지표
     st.subheader("👥 사용자 활동 분석 (Engagement)")
     
@@ -2615,6 +2828,13 @@ def main():
 
         # [NEW] 당직메뉴얼 버튼 추가
         st.sidebar.markdown("---")
+        render_revision_sidebar_button() # [NEW] 기안/공고문 수정 버튼
+        # [NEW] 업무지시로 돌아가기 버튼
+        if st.session_state.get("app_mode") == "revision":
+            if st.sidebar.button("⬅️ 업무지시로 돌아가기", use_container_width=True):
+                st.session_state["app_mode"] = None
+                st.session_state["workflow_result"] = None
+                st.rerun()
         render_duty_manual_button(sb, llm_service)
         render_history_list(sb)
     else:
@@ -2679,305 +2899,442 @@ def main():
     col_left, col_right = st.columns([1, 1.15], gap="large")
 
     with col_right:
+        st.write("")  # Force column to render
+        
         # 애니메이션 및 결과가 표시될 메인 플레이스홀더
         right_panel_placeholder = st.empty()
 
-        if "workflow_result" not in st.session_state:
-            # 초기 상태: 문서 미리보기 안내
+        if "workflow_result" not in st.session_state or not st.session_state.workflow_result:
+            # 초기 상태: 문서 미리보기 안내 (모드별 메시지)
             with right_panel_placeholder.container():
-                st.markdown(
-                    """
-                    <div style='text-align: center; padding: 6rem 2rem; 
-                                background: white; border-radius: 16px; 
-                                border: 2px dashed #d1d5db; box-shadow: 0 1px 3px rgba(0,0,0,0.1);'>
-                        <div style='font-size: 4rem; margin-bottom: 1rem; opacity: 0.5;'>📄</div>
-                        <h3 style='color: #6b7280; font-size: 1.5rem; font-weight: 700; margin-bottom: 0.75rem;'>
-                            Document Preview
-                        </h3>
-                        <p style='color: #9ca3af; font-size: 1rem; line-height: 1.6;'>
-                            왼쪽에서 업무를 지시하면<br>완성된 공문서가 여기에 나타납니다.
-                        </p>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-            # return # 여기서 return하면 안됨, placeholder 객체가 필요함
-        
-        # 결과가 있으면 아래에서 렌더링 (else 블록 아님, 흐름 제어 주의)
+                if st.session_state.get("app_mode") == "revision":
+                    # 기안/공고문 수정 모드
+                    st.markdown(
+                        """
+                        <div style='text-align: center; padding: 6rem 2rem; 
+                                    background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%); 
+                                    border-radius: 16px; 
+                                    border: 2px dashed #f59e0b; box-shadow: 0 4px 6px rgba(0,0,0,0.1);'>
+                            <div style='font-size: 4rem; margin-bottom: 1rem;'>✨</div>
+                            <h3 style='color: #92400e; font-size: 1.5rem; font-weight: 700; margin-bottom: 0.75rem;'>
+                                수정된 문서 미리보기
+                            </h3>
+                            <p style='color: #b45309; font-size: 1rem; line-height: 1.6; font-weight: 500;'>
+                                왼쪽에서 [수정안 생성] 버튼을 누르면<br>
+                                <strong>✅ 수정된 공문서가 여기에 표시됩니다</strong>
+                            </p>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    # 일반 업무 지시 모드
+                    st.markdown(
+                        """
+                        <div style='text-align: center; padding: 6rem 2rem; 
+                                    background: white; border-radius: 16px; 
+                                    border: 2px dashed #d1d5db; box-shadow: 0 1px 3px rgba(0,0,0,0.1);'>
+                            <div style='font-size: 4rem; margin-bottom: 1rem; opacity: 0.5;'>📄</div>
+                            <h3 style='color: #6b7280; font-size: 1.5rem; font-weight: 700; margin-bottom: 0.75rem;'>
+                                Document Preview
+                            </h3>
+                            <p style='color: #9ca3af; font-size: 1rem; line-height: 1.6;'>
+                                왼쪽에서 업무를 지시하면<br>완성된 공문서가 여기에 나타납니다.
+                            </p>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+        else:
+            # 결과가 있을 때 렌더링(여기서 처리하도록 이동)
+            with right_panel_placeholder.container():
+                res = st.session_state.workflow_result
+                
+                # [REVISION MODE] 수정된 문서 렌더링
+                if st.session_state.get("app_mode") == "revision":
+                    revised_doc = res.get("revised_doc")
+                    if revised_doc:
+                        st.markdown("### 📄 수정된 공문서")
+                        # 간단한 렌더링
+                        st.info(f"**제목**: {revised_doc.get('title', 'N/A')}")
+                        st.info(f"**수신**: {revised_doc.get('receiver', 'N/A')}")
+                        st.markdown("**본문**:")
+                        for p in revised_doc.get('body_paragraphs', []):
+                            st.markdown(f"- {p}")
+                    else:
+                        st.warning("수정된 문서 내용이 없습니다.")
 
     with col_left:
-        render_header("🗣️ 업무 지시")
+        # ---------------------------------------------------------
+        # [MODE] 기안/공고문 수정 모드
+        # ---------------------------------------------------------
+        if st.session_state.get("app_mode") == "revision":
+            render_header("📝 기안/공고문 수정")
+            
+            # 사용 안내
+            with st.expander("💡 사용법", expanded=False):
+                st.markdown("""
+                1. **원문 붙여넣기**: 수정할 기안문이나 공고문을 아래 '원문' 칸에 붙여넣으세요.
+                2. **수정 요청 작성**: '수정 요청사항' 칸에 원하는 변경 내용을 작성하세요.
+                   - 예: "일시를 내일로 변경", "제목을 더 부드럽게", "오타 수정" 등
+                3. **생성 버튼 클릭**: 아래 '수정안 생성' 버튼을 누르면 오른쪽에 결과가 나타납니다.
+                """)
+            
+            st.markdown("### 📄 원문")
+            original_text = st.text_area(
+                "원문 (기존 공문이나 공고문을 붙여넣으세요)",
+                height=200,
+                placeholder="여기에 수정할 문서의 원문을 붙여넣으세요.\n\n예시:\n제 목: 2025년 시민참여 예산 설명회 개최 안내\n수 신: 각 부서장\n발 신: 기획예산과\n\n시민참여 예산 설명회를 아래와 같이 개최하오니...",
+                key="revision_original",
+                label_visibility="collapsed",
+            )
+            
+            st.markdown("### ✏️ 수정 요청사항")
+            revision_request = st.text_area(
+                "수정 요청사항 (어떤 부분을 어떻게 수정할지 작성하세요)",
+                height=150,
+                placeholder="수정을 원하는 내용을 구체적으로 작성해주세요.\n\n예시:\n- 일시를 2025. 1. 28.로 변경해주세요\n- 제목을 좀 더 부드럽게 바꿔주세요\n- '엄격히' 같은 위압적인 표현을 순화해주세요\n- 날짜 표기를 2025년 1월 표준 형식으로 통일해주세요",
+                key="revision_request",
+                label_visibility="collapsed",
+            )
+            
+            if st.button("✨ 수정안 생성", type="primary", use_container_width=True):
+                if not original_text and not revision_request:
+                    st.warning("⚠️ 원문과 수정 요청사항을 모두 입력해주세요.")
+                elif not original_text:
+                    st.warning("⚠️ 원문을 입력해주세요.")
+                elif not revision_request:
+                    st.warning("⚠️ 수정 요청사항을 입력해주세요.")
+                else:
+                    # 두 입력을 합쳐서 전달
+                    combined_input = f"[원문]\n{original_text}\n\n[수정 요청]\n{revision_request}"
+                    with st.spinner("문서 수정 분석 중..."):
+                        res = run_revision_workflow(combined_input, llm_service)
+                        st.session_state.workflow_result = res
+                        st.rerun()
 
-        user_input = st.text_area(
-            "업무 내용",
-            height=190,
-            placeholder="예시\n- 상황: (무슨 일 / 어디 / 언제 / 증거 유무...)\n- 쟁점: (요건/절차/근거...)\n- 요청: (원하는 결과물: 회신/사전통지/처분 등)",
-            label_visibility="collapsed",
-        )
+            # 결과가 있으면 왼쪽에 변경 로그 표시
+            if "workflow_result" in st.session_state:
+                res = st.session_state.workflow_result
+                if res and "changelog" in res:
+                    st.markdown("---")
+                    render_header("🔍 변경 로그")
+                    # [FIX] Use markdown list for compact spacing
+                    logs = res.get("changelog", [])
+                    if logs:
+                        md_text = ""
+                        for log in logs:
+                            md_text += f"- ✅ {log}\n"
+                        st.markdown(md_text)
+                    
+                    if res.get("summary"):
+                        st.caption(res.get("summary"))
 
-        st.markdown(
-            """
-            <div style='background: #fef3c7; border-left: 4px solid #f59e0b; 
-                        padding: 1rem; border-radius: 8px; margin: 1rem 0;'>
-                <p style='margin: 0; color: #92400e; font-size: 0.9rem; font-weight: 500;'>
-                    ⚠️ 민감정보(성명·연락처·주소·차량번호 등) 입력 금지
-                </p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        # ---------------------------------------------------------
+        # [MODE] 기본 모드 (업무 지시)
+        # ---------------------------------------------------------
+        else:
+            render_header("🗣️ 업무 지시")
 
-        if st.button("⚡ 스마트 분석 시작", type="primary", use_container_width=True):
-            if not user_input:
-                st.warning("내용을 입력해주세요.")
-            else:
-                # 진행 상황은 run_workflow 내부에서 애니메이션으로 표시됨 (오른쪽 패널)
-                res = run_workflow(user_input, right_panel_placeholder)
-                res["app_mode"] = st.session_state.get("app_mode", "신속")
+            user_input = st.text_area(
+                "업무 내용",
+                height=190,
+                placeholder="예시\n- 상황: (무슨 일 / 어디 / 언제 / 증거 유무...)\n- 쟁점: (요건/절차/근거...)\n- 요청: (원하는 결과물: 회신/사전통지/처분 등)",
+                label_visibility="collapsed",
+            )
 
-                archive_id = None
-                if sb:
-                    archive_id = db_insert_archive(sb, user_input, res)
-                    if archive_id:
-                        st.session_state.current_archive_id = archive_id
-                        log_event(sb, "workflow_run", archive_id=archive_id, meta={"prompt_len": len(user_input)})
-
-                res["archive_id"] = archive_id
-                st.session_state.workflow_result = res
-                st.session_state.followup_messages = []
-                st.rerun()
-
-        if "workflow_result" in st.session_state:
-            res = st.session_state.workflow_result
-            pack = res.get("lawbot_pack") or {}
-            if pack.get("url"):
-                render_lawbot_button(pack["url"])
-
-            render_header("🧠 케이스 분석")
-
-            a = res.get("analysis", {})
             st.markdown(
-                f"""
-                <div style='background: #eff6ff; padding: 1rem; border-radius: 8px; border-left: 4px solid #2563eb; margin-bottom: 1rem;'>
-                    <p style='margin: 0 0 0.5rem 0; color: #1e40af; font-weight: 600;'>유형: {a.get('case_type','')}</p>
-                    <p style='margin: 0; color: #1e40af;'>쟁점: {", ".join(a.get("core_issue", []))}</p>
+                """
+                <div style='background: #fef3c7; border-left: 4px solid #f59e0b; 
+                            padding: 1rem; border-radius: 8px; margin: 1rem 0;'>
+                    <p style='margin: 0; color: #92400e; font-size: 0.9rem; font-weight: 500;'>
+                        ⚠️ 민감정보(성명·연락처·주소·차량번호 등) 입력 금지
+                    </p>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
 
-            with st.expander("📋 누락정보/증빙/리스크/다음행동 보기", expanded=False):
-                st.markdown("**추가 확인 질문**")
-                for x in a.get("required_facts", []):
-                    st.write("- ", x)
-                st.markdown("**필요 증빙**")
-                for x in a.get("required_evidence", []):
-                    st.write("- ", x)
-                st.markdown("**절차 리스크**")
-                for x in a.get("risk_flags", []):
-                    st.write("- ", x)
-                st.markdown("**권장 다음 행동**")
-                for x in a.get("recommended_next_action", []):
-                    st.write("- ", x)
+            if st.button("⚡ 스마트 분석 시작", type="primary", use_container_width=True):
+                if not user_input:
+                    st.warning("내용을 입력해주세요.")
+                else:
+                    # 진행 상황은 run_workflow 내부에서 애니메이션으로 표시됨 (오른쪽 패널)
+                    res = run_workflow(user_input, right_panel_placeholder)
+                    res["app_mode"] = st.session_state.get("app_mode", "신속")
 
-            # 법령 근거 + 뉴스/사례 2단 레이아웃
-            law_col, news_col = st.columns(2, gap="medium")
-            
-            with law_col:
-                render_header("📜 핵심 법령 근거")
-                law_content = res.get("law", "")
-                # 스크롤 가능한 컨테이너 (st.container + height)
-                with st.container(height=400):
-                    st.markdown(law_content)
-            
-            with news_col:
-                render_header("📰 뉴스/사례")
-                news_content = res.get("search", "")
-                # 스크롤 가능한 컨테이너 (st.container + height)
-                with st.container(height=400):
-                    st.markdown(news_content)
-            
-            # 원문 링크 섹션
-            law_pack = res.get("law_pack", {})
-            items = law_pack.get("items", [])
-            if items:
+                    archive_id = None
+                    if sb:
+                        archive_id = db_insert_archive(sb, user_input, res)
+                        if archive_id:
+                            st.session_state.current_archive_id = archive_id
+                            log_event(sb, "workflow_run", archive_id=archive_id, meta={"prompt_len": len(user_input)})
 
-                # 원문 링크들을 그리드로 표시
-                link_cols = st.columns(3)
-                for idx, item in enumerate(items[:9]):  # 최대 9개
-                    law_name = item.get("law_name", "법령")
-                    link = item.get("current_link", "")
-                    if link:
-                        with link_cols[idx % 3]:
-                            st.markdown(
-                                f"""
-                                <a href='{link}' target='_blank' style='display: block; 
-                                    background: linear-gradient(135deg, #ffffff 0%, #fefce8 100%); 
-                                    padding: 1rem 1.25rem; border-radius: 12px;
-                                    text-decoration: none; color: #92400e; font-weight: 700;
-                                    font-size: 1.1rem;
-                                    border: 2px solid #fcd34d; margin-bottom: 0.75rem;
-                                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-                                    transition: all 0.2s ease;'>
-                                    <span style='font-size: 1.3rem; margin-right: 0.5rem;'>📄</span>
-                                    {law_name}
-                                </a>
-                                <style>
-                                    a:hover {{
-                                        transform: translateY(-2px);
-                                        box-shadow: 0 4px 8px rgba(0,0,0,0.15);
-                                    }}
-                                </style>
-                                """,
-                                unsafe_allow_html=True
-                            )
+                    res["archive_id"] = archive_id
+                    st.session_state.workflow_result = res
+                    st.session_state.followup_messages = []
+                    st.rerun()
 
-            render_header("🧭 처리 가이드")
-            st.markdown(res.get("strategy", ""))
+            if st.session_state.get("workflow_result"):
+                res = st.session_state.workflow_result
+                if res:  # None 체크
+                    pack = res.get("lawbot_pack") or {}
+                if pack.get("url"):
+                    render_lawbot_button(pack["url"])
 
-            render_header("🗺️ 절차 플랜")
-            proc = res.get("procedure", {})
-            with st.expander("타임라인", expanded=True):
-                for step in proc.get("timeline", []):
-                    st.markdown(f"**{step.get('step')}. {step.get('name')}** — {step.get('goal')}")
-                    for x in step.get("actions", []):
-                        st.write("- 행동:", x)
-                    for x in step.get("records", []):
-                        st.write("- 기록:", x)
-                    if step.get("legal_note"):
-                        st.caption(f"법/유의: {step['legal_note']}")
-                    st.write("")
-            with st.expander("체크리스트/서식", expanded=False):
-                st.markdown("**체크리스트**")
-                for x in proc.get("checklist", []):
-                    st.write("- ", x)
-                st.markdown("**필요 서식/문서**")
-                for x in proc.get("templates", []):
-                    st.write("- ", x)
+                render_header("🧠 케이스 분석")
 
-    # 결과 렌더링 (오른쪽 컬럼 다시 진입 필요? 아니면 위에서 처리?)
-    # Streamlit 흐름상 col_right 컨텍스트가 닫혔으므로, 다시 열거나 위에서 처리해야 함.
-    # 하지만 col_right는 위에서 이미 정의됨.
-    # 구조를 약간 바꿔야 함. col_right 내용을 아래로 빼는 것이 좋음.
-    
-    if "workflow_result" in st.session_state:
+                a = res.get("analysis", {})
+                st.markdown(
+                    f"""
+                    <div style='background: #eff6ff; padding: 1rem; border-radius: 8px; border-left: 4px solid #2563eb; margin-bottom: 1rem;'>
+                        <p style='margin: 0 0 0.5rem 0; color: #1e40af; font-weight: 600;'>유형: {a.get('case_type','')}</p>
+                        <p style='margin: 0; color: #1e40af;'>쟁점: {", ".join(a.get("core_issue", []))}</p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                with st.expander("📋 누락정보/증빙/리스크/다음행동 보기", expanded=False):
+                    st.markdown("**추가 확인 질문**")
+                    for x in a.get("required_facts", []):
+                        st.write("- ", x)
+                    st.markdown("**필요 증빙**")
+                    for x in a.get("required_evidence", []):
+                        st.write("- ", x)
+                    st.markdown("**절차 리스크**")
+                    for x in a.get("risk_flags", []):
+                        st.write("- ", x)
+                    st.markdown("**권장 다음 행동**")
+                    for x in a.get("recommended_next_action", []):
+                        st.write("- ", x)
+
+                # 법령 근거 + 뉴스/사례 2단 레이아웃
+                law_col, news_col = st.columns(2, gap="medium")
+                
+                with law_col:
+                    render_header("📜 핵심 법령 근거")
+                    law_content = res.get("law", "")
+                    # 스크롤 가능한 컨테이너 (st.container + height)
+                    with st.container(height=400):
+                        st.markdown(law_content)
+                
+                with news_col:
+                    render_header("📰 뉴스/사례")
+                    news_content = res.get("search", "")
+                    # 스크롤 가능한 컨테이너 (st.container + height)
+                    with st.container(height=400):
+                        st.markdown(news_content)
+                
+                # 원문 링크 섹션
+                law_pack = res.get("law_pack", {})
+                items = law_pack.get("items", [])
+                if items:
+                    # 원문 링크들을 그리드로 표시
+                    link_cols = st.columns(3)
+                    for idx, item in enumerate(items[:9]):  # 최대 9개
+                        law_name = item.get("law_name", "법령")
+                        link = item.get("current_link", "")
+                        if link:
+                            with link_cols[idx % 3]:
+                                st.markdown(
+                                    f"""
+                                    <a href='{link}' target='_blank' style='display: block; 
+                                        background: linear-gradient(135deg, #ffffff 0%, #fefce8 100%); 
+                                        padding: 1rem 1.25rem; border-radius: 12px;
+                                        text-decoration: none; color: #92400e; font-weight: 700;
+                                        font-size: 1.1rem;
+                                        border: 2px solid #fcd34d; margin-bottom: 0.75rem;
+                                        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                                        transition: all 0.2s ease;'>
+                                        <span style='font-size: 1.3rem; margin-right: 0.5rem;'>📄</span>
+                                        {law_name}
+                                    </a>
+                                    <style>
+                                        a:hover {{
+                                            transform: translateY(-2px);
+                                            box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+                                        }}
+                                    </style>
+                                    """,
+                                    unsafe_allow_html=True
+                                )
+
+                render_header("🧭 처리 가이드")
+                st.markdown(res.get("strategy", ""))
+
+                render_header("🗺️ 절차 플랜")
+                proc = res.get("procedure", {})
+                with st.expander("타임라인", expanded=True):
+                    for step in proc.get("timeline", []):
+                        st.markdown(f"**{step.get('step')}. {step.get('name')}** — {step.get('goal')}")
+                        for x in step.get("actions", []):
+                            st.write("- 행동:", x)
+                        for x in step.get("records", []):
+                            st.write("- 기록:", x)
+                        if step.get("legal_note"):
+                            st.caption(f"법/유의: {step['legal_note']}")
+                        st.write("")
+                with st.expander("체크리스트/서식", expanded=False):
+                    st.markdown("**체크리스트**")
+                    for x in proc.get("checklist", []):
+                        st.write("- ", x)
+                    st.markdown("**필요 서식/문서**")
+                    for x in proc.get("templates", []):
+                        st.write("- ", x)
+
+    # ---------------------------------------------------------
+    # RIGHT PANEL RENDER (결과물)
+    # ---------------------------------------------------------
+    if "workflow_result" in st.session_state and st.session_state.workflow_result:
         # 오른쪽 패널에 결과 렌더링
         with right_panel_placeholder.container():
             res = st.session_state.workflow_result
-            doc = res.get("doc")
-            meta = res.get("meta") or {}
-            archive_id = res.get("archive_id") or st.session_state.get("current_archive_id")
-
-            render_header("📄 공문서")
-
-            if not doc:
-                st.warning("공문 생성 결과(doc)가 비어 있습니다.")
-            else:
-                html = f"""
-    <div class="paper-sheet">
-      <div class="stamp">직인생략</div>
-      <div class="doc-header">{_escape(doc.get('title', '공 문 서'))}</div>
-      <div class="doc-info">
-        <span>문서번호: {_escape(meta.get('doc_num',''))}</span>
-        <span>시행일자: {_escape(meta.get('today_str',''))}</span>
-        <span>수신: {_escape(doc.get('receiver', '수신자 참조'))}</span>
-      </div>
-      <hr style="border: 1px solid black; margin-bottom: 30px;">
-      <div class="doc-body">
-    """
-                paragraphs = doc.get("body_paragraphs", [])
-                if isinstance(paragraphs, str):
-                    paragraphs = [paragraphs]
-                for p in paragraphs:
-                    html += f"<p style='margin-bottom: 14px;'>{md_bold_to_html_safe(p)}</p>"
-                html += f"""
-      </div>
-      <div class="doc-footer">{_escape(doc.get('department_head', '행정기관장'))}</div>
-    </div>
-    """
-                st.markdown(html, unsafe_allow_html=True)
-
-            render_header("💬 후속 질문")
-
-            if not archive_id:
-                st.info("저장된 archive_id가 없습니다. (DB 저장 실패 가능)")
-            else:
-                # DB 저장 성공 표시 (기존 후속 질문 횟수 표시 대체)
-                if archive_id:
-                    st.success("✅ 업무 지시 내용이 DB에 안전하게 저장되었습니다.")
-                else:
-                    st.error("❌ DB 저장 실패 (Archive ID 없음)")
-
-            if "followup_messages" not in st.session_state:
-                st.session_state.followup_messages = res.get("followups", []) or []
-
-            used = len([m for m in st.session_state.followup_messages if m.get("role") == "user"])
-            remain = max(0, MAX_FOLLOWUP_Q - used)
             
-            pack = res.get("lawbot_pack") or {}
-            if pack.get("url"):
-                render_lawbot_button(pack["url"])
+            # [REVISION MODE] 수정된 문서 렌더링
+            if st.session_state.get("app_mode") == "revision":
+                revised_doc = res.get("revised_doc")
+                if revised_doc:
+                    render_header("📄 수정된 공문서")
+                    html = f"""
+        <div class="paper-sheet">
+          <div class="stamp">직인생략</div>
+          <div class="doc-header">{_escape(revised_doc.get('title') or '공 문 서')}</div>
+          <div class="doc-info">
+            <span>문서번호: (수정본)</span>
+            <span>시행일자: {safe_now_utc_iso()[:10]}</span>
+            <span>수신: {_escape(revised_doc.get('receiver') or '수신자 참조')}</span>
+          </div>
+          <hr style="border: 1px solid black; margin-bottom: 30px;">
+          <div class="doc-body">
+        """
+                    paragraphs = revised_doc.get("body_paragraphs", [])
+                    if isinstance(paragraphs, str):
+                        paragraphs = [paragraphs]
+                    for p in paragraphs:
+                        html += f"<p style='margin-bottom: 14px;'>{md_bold_to_html_safe(p)}</p>"
+                    html += f"""
+          </div>
+          <div class="doc-footer">{_escape(revised_doc.get('department_head') or '행정기관장')}</div>
+        </div>
+        """
+                    st.markdown(html, unsafe_allow_html=True)
+                else:
+                    st.info("수정된 문서 내용이 없습니다.")
 
-            for m in st.session_state.followup_messages:
-                with st.chat_message(m["role"]):
-                    st.markdown(m["content"])
-
-            if remain == 0:
-                st.markdown(
-                    """
-                    <div style='background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%); 
-                                padding: 1rem; border-radius: 12px; border-left: 4px solid #ef4444;
-                                text-align: center; margin: 1.5rem 0;'>
-                        <p style='margin: 0; color: #991b1b; font-weight: 600; font-size: 1rem;'>
-                            ⚠️ 후속 질문 한도(5회)를 모두 사용했습니다.
-                        </p>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
+            # [NORMAL MODE] 기존 공문 렌더링
             else:
-                st.markdown(
-                    f"""
-                    <div style='background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%); 
-                                padding: 1.25rem; border-radius: 12px; 
-                                border: 2px solid #3b82f6;
-                                margin: 1.5rem 0 1rem 0;
-                                box-shadow: 0 4px 6px -1px rgba(59, 130, 246, 0.2);
-                                animation: pulse-border 2s ease-in-out infinite;'>
-                        <div style='display: flex; align-items: center; gap: 1rem;'>
-                            <div style='font-size: 2.5rem; line-height: 1;'>💬</div>
-                            <div style='flex: 1;'>
-                                <p style='margin: 0 0 0.5rem 0; color: #1e40af; font-weight: 700; font-size: 1.1rem;'>
-                                    👇 아래 입력창에 후속 질문을 입력하세요 (남은 횟수: {remain}회)
-                                </p>
-                                <p style='margin: 0; color: #3b82f6; font-size: 0.9rem;'>
-                                    분석 결과에 대해 추가로 궁금한 점을 물어보세요
-                                </p>
+                doc = res.get("doc")
+                meta = res.get("meta") or {}
+                archive_id = res.get("archive_id") or st.session_state.get("current_archive_id")
+
+                render_header("📄 공문서")
+
+                if not doc:
+                    st.warning("공문 생성 결과(doc)가 비어 있습니다.")
+                else:
+                    html = f"""
+        <div class="paper-sheet">
+          <div class="stamp">직인생략</div>
+          <div class="doc-header">{_escape(doc.get('title', '공 문 서'))}</div>
+          <div class="doc-info">
+            <span>문서번호: {_escape(meta.get('doc_num',''))}</span>
+            <span>시행일자: {_escape(meta.get('today_str',''))}</span>
+            <span>수신: {_escape(doc.get('receiver', '수신자 참조'))}</span>
+          </div>
+          <hr style="border: 1px solid black; margin-bottom: 30px;">
+          <div class="doc-body">
+        """
+                    paragraphs = doc.get("body_paragraphs", [])
+                    if isinstance(paragraphs, str):
+                        paragraphs = [paragraphs]
+                    for p in paragraphs:
+                        html += f"<p style='margin-bottom: 14px;'>{md_bold_to_html_safe(p)}</p>"
+                    html += f"""
+          </div>
+          <div class="doc-footer">{_escape(doc.get('department_head', '행정기관장'))}</div>
+        </div>
+        """
+                    st.markdown(html, unsafe_allow_html=True)
+
+                render_header("💬 후속 질문")
+
+                if not archive_id:
+                    st.info("저장된 archive_id가 없습니다. (DB 저장 실패 가능)")
+                else:
+                    # DB 저장 성공 표시
+                    st.success("✅ 업무 지시 내용이 DB에 안전하게 저장되었습니다.")
+
+                if "followup_messages" not in st.session_state:
+                    st.session_state.followup_messages = res.get("followups", []) or []
+
+                used = len([m for m in st.session_state.followup_messages if m.get("role") == "user"])
+                remain = max(0, MAX_FOLLOWUP_Q - used)
+                
+                pack = res.get("lawbot_pack") or {}
+                if pack.get("url"):
+                    render_lawbot_button(pack["url"])
+
+                for m in st.session_state.followup_messages:
+                    with st.chat_message(m["role"]):
+                        st.markdown(m["content"])
+
+                if remain == 0:
+                    st.markdown(
+                        """
+                        <div style='background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%); 
+                                    padding: 1rem; border-radius: 12px; border-left: 4px solid #ef4444;
+                                    text-align: center; margin: 1.5rem 0;'>
+                            <p style='margin: 0; color: #991b1b; font-weight: 600; font-size: 1rem;'>
+                                ⚠️ 후속 질문 한도(5회)를 모두 사용했습니다.
+                            </p>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        f"""
+                        <div style='background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%); 
+                                    padding: 1.25rem; border-radius: 12px; 
+                                    border: 2px solid #3b82f6;
+                                    margin: 1.5rem 0 1rem 0;
+                                    box-shadow: 0 4px 6px -1px rgba(59, 130, 246, 0.2);
+                                    animation: pulse-border 2s ease-in-out infinite;'>
+                            <div style='display: flex; align-items: center; gap: 1rem;'>
+                                <div style='font-size: 2.5rem; line-height: 1;'>💬</div>
+                                <div style='flex: 1;'>
+                                    <p style='margin: 0 0 0.5rem 0; color: #1e40af; font-weight: 700; font-size: 1.1rem;'>
+                                        👇 아래 입력창에 후속 질문을 입력하세요 (남은 횟수: {remain}회)
+                                    </p>
+                                    <p style='margin: 0; color: #3b82f6; font-size: 0.9rem;'>
+                                        분석 결과에 대해 추가로 궁금한 점을 물어보세요
+                                    </p>
+                                </div>
                             </div>
                         </div>
-                    </div>
-                    <style>
-                        @keyframes pulse-border {{
-                            0%, 100% {{ border-color: #3b82f6; }}
-                            50% {{ border-color: #60a5fa; }}
-                        }}
-                    </style>
-                    """,
-                    unsafe_allow_html=True,
-                )
+                        <style>
+                            @keyframes pulse-border {{
+                                0%, 100% {{ border-color: #3b82f6; }}
+                                50% {{ border-color: #60a5fa; }}
+                            }}
+                        </style>
+                        """,
+                        unsafe_allow_html=True,
+                    )
 
-            q = st.chat_input("💭 후속 질문을 입력하세요... (Enter로 전송)")
-            if q:
-                turn = used + 1
-                st.session_state.followup_messages.append({"role": "user", "content": q})
-                db_insert_followup(sb, archive_id, turn=turn * 2 - 1, role="user", content=q)
-                log_event(sb, "followup_user", archive_id=archive_id, meta={"turn": turn})
+                q = st.chat_input("💭 후속 질문을 입력하세요... (Enter로 전송)")
+                if q:
+                    turn = used + 1
+                    st.session_state.followup_messages.append({"role": "user", "content": q})
+                    db_insert_followup(sb, archive_id, turn=turn * 2 - 1, role="user", content=q)
+                    log_event(sb, "followup_user", archive_id=archive_id, meta={"turn": turn})
 
-                # This part needs to be inside the container to be rendered by the placeholder
-                with st.chat_message("user"):
-                    st.markdown(q)
+                    # This part needs to be inside the container to be rendered by the placeholder
+                    with st.chat_message("user"):
+                        st.markdown(q)
 
-                case_context = f"""
+                    case_context = f"""
 [케이스]
 상황: {res.get('situation','')}
 
@@ -2996,7 +3353,7 @@ def main():
 처리방향:
 {res.get('strategy','')[:2200]}
 """
-                prompt = f"""
+                    prompt = f"""
 너는 '케이스 고정 행정 후속 Q&A'이다.
 {case_context}
 
@@ -3009,16 +3366,16 @@ def main():
 - 모르면 모른다고 말하고, 추가 법령 근거는 Lawbot으로 찾게 안내한다.
 - 서론 없이 실무형으로.
 """
-                with st.chat_message("assistant"):
-                    with st.spinner("후속 답변 생성 중..."):
-                        ans = llm_service.generate_text(prompt)
-                        st.markdown(ans)
+                    with st.chat_message("assistant"):
+                        with st.spinner("후속 답변 생성 중..."):
+                            ans = llm_service.generate_text(prompt)
+                            st.markdown(ans)
 
-                st.session_state.followup_messages.append({"role": "assistant", "content": ans})
-                db_insert_followup(sb, archive_id, turn=turn * 2, role="assistant", content=ans)
-                log_event(sb, "followup_assistant", archive_id=archive_id, meta={"turn": turn})
+                    st.session_state.followup_messages.append({"role": "assistant", "content": ans})
+                    db_insert_followup(sb, archive_id, turn=turn * 2, role="assistant", content=ans)
+                    log_event(sb, "followup_assistant", archive_id=archive_id, meta={"turn": turn})
 
-                st.rerun()
+                    st.rerun()
 
 if __name__ == "__main__":
     main()
