@@ -3019,6 +3019,7 @@ def main():
                         st.write("1. 원문 분석 및 표준 규격 대조 중...")
                         time.sleep(0.5) # UX용 짧은 대기
                         st.write("2. 오탈자 및 표현 교정 진행 중...")
+                        sb = st.empty()
                         
                         user_email = st.session_state.get("user_email")
                         res = run_revision_workflow(combined_input, llm_service, sb, user_email)
