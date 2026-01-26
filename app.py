@@ -196,19 +196,29 @@ st.markdown("""
 <style>
     /* 채팅 입력창 컨테이너 스타일링 */
     [data-testid="stChatInput"] {
+        position: fixed !important;
+        bottom: 40px !important;
+        left: 50% !important;
+        transform: translateX(-50%) !important;
+        width: 700px !important;
+        max-width: 90% !important;
+        z-index: 9999 !important;
         background-color: white !important;
         border-radius: 15px !important;
         box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15) !important;
         border: 2px solid #4A90E2 !important;
         padding: 10px !important;
-        margin-top: 20px !important;
     }
     
     /* 입력창 내부 스타일 */
     [data-testid="stChatInput"] textarea {
         background-color: transparent !important;
     }
-
+    
+    /* 하단 여백 확보 */
+    .main .block-container {
+        padding-bottom: 150px !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 st.markdown(
@@ -733,6 +743,8 @@ st.markdown(
     footer { display: none !important; }
     div[data-testid="stStatusWidget"] { display: none !important; }
     
+
+
     .agent-log { 
         font-family: 'Inter', 'Consolas', monospace; 
         font-size: 0.9rem; 
