@@ -67,6 +67,8 @@ MODEL_PRICING = {
 
 from govable_ai.features.duty_manual import render_duty_manual_button
 from govable_ai.features.document_revision import render_revision_sidebar_button, run_revision_workflow
+from govable_ai.ui.premium_animations import render_revision_animation
+from govable_ai.export import generate_official_docx, generate_guide_docx
 from govable_ai.core.llm_service import LLMService
 from govable_ai.config import get_secret, get_vertex_config
 
@@ -182,7 +184,33 @@ def render_header(title):
 # =========================================================
 # 2) STYLES  (✅ 여기 CSS/디자인은 네가 준 그대로. 변경 없음)
 # =========================================================
-st.set_page_config(layout="wide", page_title="AI 행정관 Pro - Govable AI", page_icon="⚖️",initial_sidebar_state="expanded",)
+st.set_page_config(
+    page_title="AI 행정관 Pro - Govable AI",
+    page_icon="⚖️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# 후속 질문창 플로팅 스타일
+st.markdown("""
+<style>
+    /* 채팅 입력창 컨테이너 스타일링 */
+    [data-testid="stChatInput"] {
+        background-color: white !important;
+        border-radius: 15px !important;
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15) !important;
+        border: 2px solid #4A90E2 !important;
+        padding: 10px !important;
+        margin-top: 20px !important;
+    }
+    
+    /* 입력창 내부 스타일 */
+    [data-testid="stChatInput"] textarea {
+        background-color: transparent !important;
+    }
+
+</style>
+""", unsafe_allow_html=True)
 st.markdown(
     """
 <style>
@@ -2992,18 +3020,20 @@ def main():
             st.markdown("### 📄 원문")
             original_text = st.text_area(
                 "원문 (기존 공문이나 공고문을 붙여넣으세요)",
+                value=st.session_state.get("revision_org_text", ""),
                 height=200,
                 placeholder="여기에 수정할 문서의 원문을 붙여넣으세요.\n\n예시:\n제 목: 2025년 시민참여 예산 설명회 개최 안내\n수 신: 각 부서장\n발 신: 기획예산과\n\n시민참여 예산 설명회를 아래와 같이 개최하오니...",
-                key="revision_original",
+                key="revision_org_text",
                 label_visibility="collapsed",
             )
             
             st.markdown("### ✏️ 수정 요청사항 (선택)")
             revision_request = st.text_area(
                 "수정 요청사항 (비워두면 '공문서 작성 표준'에 맞게 자동 교정합니다)",
+                value=st.session_state.get("revision_req_text", ""),
                 height=150,
                 placeholder="비워두시면 '2025 개정 공문서 작성 표준'에 맞춰 오탈자, 띄어쓰기, 표현을 자동으로 교정합니다.\n\n특정 요청이 있다면 적어주세요:\n- 일시를 2025. 1. 28.로 변경해주세요\n- 제목을 좀 더 부드럽게 바꿔주세요",
-                key="revision_request",
+                key="revision_req_text",
                 label_visibility="collapsed",
             )
             
@@ -3014,22 +3044,33 @@ def main():
                     # 두 입력을 합쳐서 전달
                     combined_input = f"[원문]\n{original_text}\n\n[수정 요청]\n{revision_request}"
                     
-                    # 진행 상황 표시 (Progressive Feedback)
-                    with st.status("📝 문서 수정 분석 중...", expanded=True) as status:
-                        st.write("1. 원문 분석 및 표준 규격 대조 중...")
-                        time.sleep(0.5) # UX용 짧은 대기
-                        st.write("2. 오탈자 및 표현 교정 진행 중...")
-                        
-                        user_email = st.session_state.get("user_email")
-                        res = run_revision_workflow(combined_input, llm_service, sb, user_email)
+                    # 프리미엄 애니메이션과 함께 워크플로우 실행
+                    user_email = st.session_state.get("user_email")
+                    
+                    # 오른쪽 패널에 애니메이션 표시
+                    try:
+                        res = render_revision_animation(
+                            right_panel_placeholder,
+                            run_revision_workflow,
+                            combined_input,
+                            llm_service,
+                            sb,
+                            user_email
+                        )
                         
                         if "error" in res:
-                            status.update(label="❌ 처리 실패", state="error")
                             st.error(res["error"])
                         else:
-                            status.update(label="✅ 수정 완료!", state="complete", expanded=False)
                             st.session_state.workflow_result = res
-                            st.rerun()
+                            
+                            # revision_id를 세션 상태에 저장
+                            if "revision_id" in res:
+                                st.session_state.current_revision_id = res["revision_id"]
+                                st.toast("💾 수정 내역이 저장되었습니다", icon="✅")
+                            
+                            # 결과를 바로 표시 (rerun 제거로 깜빡임 방지)
+                    except Exception as e:
+                        st.error(f"처리 중 오류 발생: {str(e)}")
 
             # 결과가 있으면 왼쪽에 변경 로그 표시
             if "workflow_result" in st.session_state:
@@ -3056,8 +3097,10 @@ def main():
 
             user_input = st.text_area(
                 "업무 내용",
+                value=st.session_state.get("main_task_input", ""),
                 height=190,
                 placeholder="예시\n- 상황: (무슨 일 / 어디 / 언제 / 증거 유무...)\n- 쟁점: (요건/절차/근거...)\n- 요청: (원하는 결과물: 회신/사전통지/처분 등)",
+                key="main_task_input",
                 label_visibility="collapsed",
             )
 
@@ -3095,6 +3138,31 @@ def main():
 
             if st.session_state.get("workflow_result"):
                 res = st.session_state.workflow_result
+                
+                # [SAFETY] 결과가 문자열인 경우(에러 메시지 등) 처리
+                if isinstance(res, str):
+                    try:
+                        import json
+                        res = json.loads(res)
+                    except:
+                        # JSON 파싱도 실패하면 텍스트를 분석 결과로 포장
+                        res = {
+                            "analysis": {
+                                "case_type": "일반 민원", 
+                                "core_issue": ["분석 결과가 텍스트 형식입니다."], 
+                                "summary": res,
+                                "required_facts": [],
+                                "required_evidence": [],
+                                "risk_flags": [],
+                                "recommended_next_action": []
+                            },
+                            "law": "",
+                            "strategy": res,  # 처리가이드에 텍스트 표시
+                            "procedure": {"timeline": [], "checklist": [], "templates": []}
+                        }
+                    # 변환된 결과를 다시 세션에 저장 (선택적)
+                    # st.session_state.workflow_result = res
+
                 if res:  # None 체크
                     pack = res.get("lawbot_pack") or {}
                 if pack.get("url"):
@@ -3237,6 +3305,26 @@ def main():
         </div>
         """
                     st.markdown(html, unsafe_allow_html=True)
+                    
+                    # 수정된 공문서 HWPX 다운로드
+                    st.divider()
+                    try:
+                        from datetime import datetime
+                        hwpx_bytes = generate_official_docx(revised_doc)
+                        today_str = datetime.now().strftime("%Y%m%d")
+                        title = revised_doc.get('title', '수정문서')[:20]
+                        filename = f"[수정공문]_{today_str}_{title}.docx"
+                        
+                        st.download_button(
+                            label="📥 수정된 공문서(DOCX) 다운로드",
+                            data=hwpx_bytes,
+                            file_name=filename,
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            use_container_width=True,
+                            type="primary"
+                        )
+                    except Exception as e:
+                        st.error(f"HWPX 생성 오류: {str(e)}")
                 else:
                     st.info("수정된 문서 내용이 없습니다.")
 
@@ -3274,6 +3362,85 @@ def main():
         </div>
         """
                     st.markdown(html, unsafe_allow_html=True)
+                
+                # DOCX 다운로드 버튼
+                st.divider()
+                
+                # 날짜 문자열 미리 생성 (스코프 문제 해결)
+                from datetime import datetime
+                today_str = datetime.now().strftime("%Y%m%d")
+                
+                col1, col2 = st.columns(2)
+                
+                # 왼쪽: 처리가이드
+                with col1:
+                    try:
+                        # 데이터 타입 안전 처리
+                        guide_data = res
+                        if isinstance(guide_data, str):
+                            try:
+                                import json
+                                guide_data = json.loads(guide_data)
+                            except:
+                                guide_data = {"analysis": {"summary": str(guide_data)}}
+                        
+                        guide_bytes = generate_guide_docx(guide_data)
+                        filename = f"[보고서]_{today_str}_처리가이드.docx"
+                        
+                        st.download_button(
+                            label="📊 처리가이드(DOCX) 다운로드",
+                            data=guide_bytes,
+                            file_name=filename,
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            use_container_width=True
+                        )
+                    except Exception as e:
+                        st.error(f"보고서 생성 오류: {str(e)}")
+                
+                # 오른쪽: 공문서
+                with col2:
+                    try:
+                        # 데이터 타입 안전 처리
+                        doc_data = doc
+                        if isinstance(doc_data, str):
+                            doc_data = {"title": "문서", "body_paragraphs": [str(doc_data)]}
+                            
+                        docx_bytes = generate_official_docx(doc_data)
+                        title_safe = doc_data.get('title', '문서')[:20].replace('/', '_').replace('\\', '_')
+                        filename = f"[공문]_{today_str}_{title_safe}.docx"
+                        
+                        st.download_button(
+                            label="📥 공문서(DOCX) 다운로드",
+                            data=docx_bytes,
+                            file_name=filename,
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            use_container_width=True
+                        )
+                    except Exception as e:
+                        st.error(f"공문서 생성 오류: {str(e)}")
+                
+                # 데이터 브릿지: 이 초안을 기안문 수정으로 보내기
+                st.divider()
+                if st.button("📝 이 초안을 기안문 수정으로 보내기", type="primary", use_container_width=True, key="send_to_revision"):
+                    # 데이터 추출 및 포맷팅
+                    title = doc.get("title", "")
+                    body_paragraphs = doc.get("body_paragraphs", [])
+                    if isinstance(body_paragraphs, str):
+                        body_paragraphs = [body_paragraphs]
+                    
+                    # 온나라 시스템 기안 서식 형식으로 변환
+                    formatted_text = f"제목: {title}\n\n"
+                    formatted_text += "\n".join(body_paragraphs)
+                    
+                    # 세션 상태에 주입
+                    st.session_state.revision_org_text = formatted_text
+                    st.session_state.revision_req_text = ""  # 수정 요청사항 초기화
+                    
+                    # 모드 전환
+                    st.toast("🚀 초안 데이터를 수정 모드로 전송 중...")
+                    st.session_state.app_mode = "revision"
+                    st.session_state.workflow_result = None  # 기존 결과 초기화
+                    st.rerun()
 
                 render_header("💬 후속 질문")
 
