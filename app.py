@@ -1786,10 +1786,10 @@ def build_lawbot_pack(situation: str, analysis: dict) -> dict:
     return {"core_keywords": kws[:10], "query_text": query_text[:180], "url": make_lawbot_url(query_text[:180])}
 
 
-def run_revision_workflow(user_input: str, llm_service, log_placeholder, user_email: str = None) -> dict:
+def run_workflow(user_input: str, log_placeholder, mode: str = "신속") -> dict:
     start_time = time.time()
     search_count = 0
-    logs = []  
+    logs = []  # List of dicts: {'msg': str, 'style': str, 'status': 'active'|'done', 'elapsed': float}
     phase_start_time = time.time()
 
     def render_logs():
@@ -3019,7 +3019,6 @@ def main():
                         st.write("1. 원문 분석 및 표준 규격 대조 중...")
                         time.sleep(0.5) # UX용 짧은 대기
                         st.write("2. 오탈자 및 표현 교정 진행 중...")
-                        sb = st.empty()
                         
                         user_email = st.session_state.get("user_email")
                         res = run_revision_workflow(combined_input, llm_service, sb, user_email)
