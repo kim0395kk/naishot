@@ -500,6 +500,17 @@ st.markdown(
         background: linear-gradient(90deg, transparent, rgba(59, 130, 246, 0.3));
         color: var(--primary-600);
     }
+
+
+
+    div[data-testid="stSidebar"] button[kind="primary"] {
+    background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%);
+    color: white;
+    font-weight: 700;
+    border-radius: 10px;
+    }
+
+
     
     div[data-testid="stSidebar"] button[kind="secondary"] {
         width: 100%;
