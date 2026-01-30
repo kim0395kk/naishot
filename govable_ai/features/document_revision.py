@@ -10,7 +10,7 @@ def render_revision_sidebar_button():
     사이드바에 '기안/공고문 수정' 버튼을 렌더링하고,
     클릭 시 세션 상태를 'revision' 모드로 변경합니다.
     """
-    if st.sidebar.button("\U0001F4DD 기안, 공고문 수정", use_container_width=True):
+    if st.sidebar.button("\U0001F4DD 기안, 공고문 수정", type="primary", use_container_width=True):
         st.session_state["app_mode"] = "revision"
         st.session_state["workflow_result"] = None  # 기존 결과 초기화
         st.session_state["current_archive_id"] = None
@@ -145,3 +145,4 @@ def run_revision_workflow(user_input: str, llm_service, sb=None, user_email=None
         return result
     except Exception as e:
         return {"error": f"처리 중 오류 발생: {str(e)}"}
+
