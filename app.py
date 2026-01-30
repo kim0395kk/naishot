@@ -504,10 +504,10 @@ st.markdown(
 
 
     div[data-testid="stSidebar"] button[kind="primary"] {
-    background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%);
-    color: white;
-    font-weight: 700;
-    border-radius: 10px;
+        background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%);
+        color: white;
+        font-weight: 700;
+        border-radius: 10px;
     }
 
 
