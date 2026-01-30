@@ -3154,8 +3154,8 @@ def main():
                 # [SAFETY] 결과가 문자열인 경우(에러 메시지 등) 처리
                 if isinstance(res, str):
                     try:
-                        import json
-                        res = json.loads(res)
+                        import json as _json
+                        res = _json.loads(res)
                     except:
                         # JSON 파싱도 실패하면 텍스트를 분석 결과로 포장
                         res = {
@@ -3391,8 +3391,8 @@ def main():
                         guide_data = res
                         if isinstance(guide_data, str):
                             try:
-                                import json
-                                guide_data = json.loads(guide_data)
+                                import _json
+                                guide_data = _json.loads(guide_data)
                             except:
                                 guide_data = {"analysis": {"summary": str(guide_data)}}
                         
