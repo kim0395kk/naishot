@@ -112,8 +112,15 @@ def get_supabase_config() -> Optional[Dict[str, str]]:
     Returns:
         dict with keys: url, anon_key or None
     """
-    url = get_secret("SUPABASE_URL")
-    key = get_secret("SUPABASE_ANON_KEY")
+    # 1. Try "supabase" section first (preferred)
+    url = get_secret("supabase", "SUPABASE_URL")
+    key = get_secret("supabase", "SUPABASE_KEY") or get_secret("supabase", "SUPABASE_ANON_KEY")
+    
+    # 2. Fallback to top-level or env vars if not found in section
+    if not url:
+        url = get_secret("SUPABASE_URL")
+    if not key:
+        key = get_secret("SUPABASE_KEY") or get_secret("SUPABASE_ANON_KEY")
     
     if url and key:
         return {"url": url, "anon_key": key}

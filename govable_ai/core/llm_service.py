@@ -153,17 +153,18 @@ class LLMService:
             logger.warning(f"Vertex AI 생성 실패: {e}")
             return None
     
-    def _try_gemini_api_text(self, prompt: str) -> Optional[str]:
+    def _try_gemini_api_text(self, prompt: str, preferred_model: Optional[str] = None) -> Optional[str]:
         """Gemini API로 텍스트 생성"""
         if not self._gemini_available or not self._gemini_client:
             return None
         
+        model_name = preferred_model or self.default_model
         try:
             start = time.time()
-            model = self._gemini_client.GenerativeModel("gemini-2.5-flash")
+            model = self._gemini_client.GenerativeModel(model_name)
             resp = model.generate_content(prompt)
             self.last_latency_ms = int((time.time() - start) * 1000)
-            self.last_model_used = "gemini-2.5-flash (Gemini API)"
+            self.last_model_used = f"{model_name} (Gemini API)"
             self.last_input_tokens = estimate_tokens(prompt)
             
             text = ""
@@ -176,7 +177,7 @@ class LLMService:
             self.last_output_tokens = estimate_tokens(text)
             return text
         except Exception as e:
-            logger.warning(f"Gemini API 생성 실패: {e}")
+            logger.warning(f"Gemini API 생성 실패 ({model_name}): {e}")
             return None
     
     def _try_groq_text(self, prompt: str) -> Optional[str]:
@@ -201,12 +202,13 @@ class LLMService:
             logger.warning(f"Groq 생성 실패: {e}")
             return None
     
-    def generate_text(self, prompt: str) -> str:
+    def generate_text(self, prompt: str, preferred_model: Optional[str] = None) -> str:
         """
         텍스트 생성 (Vertex AI -> Gemini API -> Groq 순서로 폴백)
         
         Args:
             prompt: 프롬프트 문자열
+            preferred_model: 우선적으로 사용할 모델 이름 (예: 'gemini-3.0-flash')
             
         Returns:
             생성된 텍스트. 모든 시도 실패 시 에러 메시지 반환.
@@ -217,7 +219,7 @@ class LLMService:
             return result
         
         # 2. Gemini API 시도
-        result = self._try_gemini_api_text(prompt)
+        result = self._try_gemini_api_text(prompt, preferred_model=preferred_model)
         if result:
             return result
         
@@ -230,17 +232,18 @@ class LLMService:
         self.last_model_used = "(failed)"
         return "[LLM 연결 실패] 모든 LLM 서비스에 연결할 수 없습니다."
     
-    def generate_json(self, prompt: str) -> Optional[Any]:
+    def generate_json(self, prompt: str, preferred_model: Optional[str] = None) -> Optional[Any]:
         """
         JSON 응답 생성
         
         Args:
             prompt: JSON 출력을 요청하는 프롬프트
+            preferred_model: 우선적으로 사용할 모델 이름 (예: 'gemini-3.0-flash')
             
         Returns:
             파싱된 JSON 객체 또는 None
         """
-        text = self.generate_text(prompt)
+        text = self.generate_text(prompt, preferred_model=preferred_model)
         return safe_json_loads(text)
     
     def get_last_usage(self) -> Dict[str, Any]:
