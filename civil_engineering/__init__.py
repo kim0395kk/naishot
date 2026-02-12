@@ -1,3 +1,0 @@
-"""
-Civil Engineering RAG Module
-"""
