@@ -142,6 +142,14 @@ except Exception:
     def get_vertex_config(*args, **kwargs):
         return None
 
+# [NEW] Civil Engineering Imports
+try:
+    from civil_engineering.rag_system import load_rag_system
+    from civil_engineering.dashboard import render_civil_dashboard
+except ImportError:
+    load_rag_system = None
+    render_civil_dashboard = None
+
 # Initialize LLM Service Globally
 try:
     llm_service = LLMService(
@@ -3452,6 +3460,12 @@ def main():
             st.session_state["workflow_result"] = None
             st.session_state["main_task_input"] = ""
             st.rerun()
+        # [NEW] 토목직 특화 AI 버튼
+        if st.sidebar.button("👷 토목직 특화 AI", use_container_width=True):
+            st.session_state["app_mode"] = "civil_engineering"
+            st.session_state["workflow_result"] = None
+            st.session_state["main_task_input"] = ""
+            st.rerun()
         # [NEW] 업무지시로 돌아가기 버튼
         if st.session_state.get("app_mode") in ["revision", "complaint_analyzer", "hallucination_check"]:
             if st.sidebar.button("⬅️ 업무지시로 돌아가기", use_container_width=True):
@@ -3694,6 +3708,141 @@ def main():
                     
                     if res.get("summary"):
                         st.caption(res.get("summary"))
+
+        # ---------------------------------------------------------
+        # [MODE] 토목직 특화 AI (Civil Engineering AI)
+        # ---------------------------------------------------------
+        elif st.session_state.get("app_mode") == "civil_engineering":
+            render_header("👷 토목직 특화 AI")
+            
+            # 탭 구성: [1. 실무 규정 질의] [2. 전문 공문 작성]
+            # [UI 개선] 탭 이름에 아이콘과 명확한 행동 동사 사용
+            ce_tab1, ce_tab2 = st.tabs(["🔍 규정/매뉴얼 검색", "✍️ 공문 초안 작성"])
+            
+            # --- Tab 1: 실무 규정 질의 (Tech Q&A) ---
+            with ce_tab1:
+                # [UI 개선] 탭 상단에 친절한 안내 문구 추가 (파란색 박스)
+                st.info("🚧 **도로폭, 양생 온도 등 궁금한 실무 규정을 물어보세요.**\n\n내부 매뉴얼과 지침을 찾아보고 정확한 근거와 함께 답변해 드립니다.")
+                
+                # 채팅 기록 초기화
+                if "civil_chat_history" not in st.session_state:
+                    st.session_state.civil_chat_history = []
+                
+                # 채팅 기록 표시
+                for msg in st.session_state.civil_chat_history:
+                    with st.chat_message(msg["role"]):
+                        st.markdown(msg["content"])
+                        if "sources" in msg and msg["sources"]:
+                            with st.expander("📚 근거 자료 확인"):
+                                for src in msg["sources"]:
+                                    st.markdown(f"- {src}")
+                
+                # 사용자 입력
+                if prompt := st.chat_input("규정이나 지침에 대해 물어보세요 (예: 겨울철 콘크리트 양생 온도 기준?)"):
+                    # 사용자 메시지 표시
+                    st.session_state.civil_chat_history.append({"role": "user", "content": prompt})
+                    with st.chat_message("user"):
+                        st.markdown(prompt)
+                    
+                    # AI 답변 생성
+                    with st.chat_message("assistant"):
+                        with st.spinner("규정을 찾아보고 있습니다..."):
+                            # RAG 시스템 로드 (캐싱됨)
+                            if load_rag_system:
+                                rag = load_rag_system()
+                                if rag:
+                                    # RAG 답변 생성
+                                    response = rag.answer_question(prompt, llm_service)
+                                    answer_text = response.get("answer", "죄송합니다. 답변을 생성하지 못했습니다.")
+                                    sources = response.get("sources", [])
+                                    
+                                    # 답변 출력
+                                    st.markdown(answer_text)
+                                    
+                                    # 근거 자료 출력
+                                    if sources:
+                                        with st.expander("📚 근거 자료 확인", expanded=True):
+                                            for src in sources:
+                                                st.markdown(f"- {src}")
+                                    
+                                    # 기록 저장
+                                    st.session_state.civil_chat_history.append({
+                                        "role": "assistant", 
+                                        "content": answer_text,
+                                        "sources": sources
+                                    })
+                                else:
+                                    st.error("RAG 시스템을 로드할 수 없습니다.")
+                            else:
+                                st.error("RAG 모듈이 설치되지 않았습니다.")
+
+            # --- Tab 2: 전문 공문 작성 (Tech Drafting) ---
+            with ce_tab2:
+                # [UI 개선] 작성 가이드 추가
+                st.info("📝 **복잡한 공문서, 핵심 내용만 입력하면 전문가 수준으로 초안을 만들어 드립니다.**\n\n공사 감독 조서, 인허가 공문 등 필요한 양식을 선택하고 내용을 적어주세요.")
+                
+                # [UI Update] 1단 레이아웃 (Full Width)
+                st.markdown("### ✍️ 작성 요청")
+                
+                draft_topic = st.text_input("공문 주제", placeholder="예: 수해복구 공사 착공신고서 접수 처리")
+                
+                # 높이 150 -> 300으로 확대
+                draft_details = st.text_area("세부 사항", height=300, 
+                                           placeholder="""예시:
+1. 업체명: (주)대한건설
+2. 공사기간: 2024.3.1 ~ 2024.6.30
+3. 특이사항: 안전관리계획서 제출 완료됨.
+4. 요청사항: 법령 근거를 포함해서 정중하게 작성해줘.""")
+                
+                if st.button("✨ 공문 초안 작성", type="primary", use_container_width=True):
+                    if not draft_topic:
+                        st.warning("공문 주제를 입력해주세요.")
+                    else:
+                        with st.spinner("규정 및 매뉴얼을 참조하여 공문을 작성 중입니다..."):
+                            if load_rag_system:
+                                rag = load_rag_system()
+                                if rag:
+                                    # 프롬프트 구성
+                                    draft_prompt = f"""
+다음 주제로 토목 공사 관련 공문 초안을 작성해줘.
+관련 법령이나 매뉴얼(착공계 처리 요령 등)을 참고해서 필수 기재 사항을 포함해줘.
+
+[주제]: {draft_topic}
+[세부사항]: {draft_details}
+
+형식:
+1. 제목
+2. 본문 (개조식)
+3. 붙임 서류 목록
+"""
+                                    
+                                    # RAG 답변 생성
+                                    response = rag.answer_question(draft_prompt, llm_service)
+                                    st.session_state.civil_draft_result = response
+                                else:
+                                    st.error("RAG 시스템 로드 실패")
+                            else:
+                                st.error("RAG 모듈 없음")
+                
+                # 결과 표시 (하단 배치)
+                if "civil_draft_result" in st.session_state:
+                    res = st.session_state.civil_draft_result
+                    
+                    st.markdown("---")
+                    st.markdown("### 📄 공문 초안")
+                    
+                    # 결과 카드 스타일
+                    st.info(res.get("answer"))
+                    
+                    # 복사 버튼 (텍스트 영역으로 제공)
+                    with st.expander("📝 텍스트로 복사하기"):
+                        st.code(res.get("answer"), language="text")
+                    
+                    # 근거 자료
+                    if res.get("sources"):
+                        with st.expander("📚 참고한 규정 및 매뉴얼", expanded=False):
+                            for src in res.get("sources"):
+                                st.caption(f"- {src}")
 
         # ---------------------------------------------------------
         # [MODE] 민원 분석기
