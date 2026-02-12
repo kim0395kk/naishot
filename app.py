@@ -3467,7 +3467,7 @@ def main():
             st.session_state["main_task_input"] = ""
             st.rerun()
         # [NEW] 업무지시로 돌아가기 버튼
-        if st.session_state.get("app_mode") in ["revision", "complaint_analyzer", "hallucination_check"]:
+        if st.session_state.get("app_mode") in ["revision", "complaint_analyzer", "hallucination_check", "civil_engineering"]:
             if st.sidebar.button("⬅️ 업무지시로 돌아가기", use_container_width=True):
                 st.session_state["app_mode"] = None
                 st.session_state["workflow_result"] = None
@@ -3559,6 +3559,25 @@ def main():
                             <p style='color: #b45309; font-size: 1rem; line-height: 1.6; font-weight: 500;'>
                                 왼쪽에서 [수정안 생성] 버튼을 누르면<br>
                                 <strong>✅ 수정된 공문서가 여기에 표시됩니다</strong>
+                            </p>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                elif st.session_state.get("app_mode") == "civil_engineering":
+                    # 토목직 특화 AI 모드
+                    st.markdown(
+                        """
+                        <div style='text-align: center; padding: 6rem 2rem; 
+                                    background: linear-gradient(135deg, #fef9c3 0%, #fde68a 100%); 
+                                    border-radius: 16px; 
+                                    border: 2px dashed #d97706; box-shadow: 0 1px 3px rgba(0,0,0,0.1);'>
+                            <div style='font-size: 4rem; margin-bottom: 1rem; opacity: 0.7;'>👷</div>
+                            <h3 style='color: #92400e; margin-bottom: 0.5rem; font-weight: 700;'>토목직 특화 AI 어시스턴트</h3>
+                            <p style='color: #78350f; margin: 0; line-height: 1.8;'>
+                                20개 내부 매뉴얼 · 지침 · 규정을 학습한 AI입니다.<br>
+                                왼쪽 <strong>규정/매뉴얼 검색</strong> 탭에서 질문하거나<br>
+                                <strong>공문 초안 작성</strong> 탭에서 문서를 생성하세요.
                             </p>
                         </div>
                         """,
